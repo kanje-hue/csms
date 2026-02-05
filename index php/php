@@ -1,0 +1,3 @@
+<?php
+echo "<h1>College Student Management System (CSMS)</h1>";
+echo "<p>Environment setup successful.</p>";

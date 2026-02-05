@@ -1,0 +1,21 @@
+<?php
+include '../config/db.php';
+
+if (isset($_POST['register'])) {
+    $reg = $_POST['reg_number'];
+    $name = $_POST['name'];
+    $email = $_POST['email'];
+    $semester = $_POST['semester'];
+    $password = password_hash($_POST['password'], PASSWORD_DEFAULT);
+
+    $sql = "INSERT INTO students 
+            (reg_number, name, email, password, semester)
+            VALUES ('$reg', '$name', '$email', '$password', '$semester')";
+
+    if (mysqli_query($conn, $sql)) {
+        echo "<p style='color:green;'>Registration successful. Wait for admin approval.</p>";
+    } else {
+        echo "<p style='color:red;'>Error: Email or Registration Number already exists.</p>";
+    }
+}
+?>
