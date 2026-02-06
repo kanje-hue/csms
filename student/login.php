@@ -8,18 +8,18 @@ include '../config/db.php';
 $message = "";
 
 // Handle login
-if(isset($_POST['login'])){
+if (isset($_POST['login'])) {
     $email = mysqli_real_escape_string($conn, $_POST['email']);
     $password = $_POST['password'];
 
     $query = "SELECT * FROM students WHERE email='$email'";
     $result = mysqli_query($conn, $query);
 
-    if(mysqli_num_rows($result) == 1){
+    if (mysqli_num_rows($result) == 1) {
         $student = mysqli_fetch_assoc($result);
 
-        if(password_verify($password, $student['password'])){
-            if($student['status'] == 'active'){
+        if (password_verify($password, $student['password'])) {
+            if ($student['status'] == 'active') {
                 $_SESSION['student_id'] = $student['student_id'];
                 $_SESSION['student_name'] = $student['name'];
 
@@ -46,7 +46,7 @@ if(isset($_POST['login'])){
     <h2>Student Login</h2>
 
     <!-- Show message -->
-    <?php if($message != ""){ echo "<p style='color:red;'>$message</p>"; } ?>
+    <?php if ($message != "") { echo "<p style='color:red;'>$message</p>"; } ?>
 
     <form method="POST" action="">
         <label>Email:</label><br>
@@ -59,5 +59,6 @@ if(isset($_POST['login'])){
     </form>
 
     <p>Don't have an account? <a href="register.php">Register here</a></p>
+    <p>Forgot your password? <a href="forgot_password.php">Reset it here</a></p>
 </body>
 </html>

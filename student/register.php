@@ -1,12 +1,11 @@
 <?php
-// Enable error reporting
+session_start();
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
 
-// Include database connection
 include '../config/db.php';
 
-$message = ""; // To show success or error messages
+$message = "";
 
 // Handle form submission
 if (isset($_POST['register'])) {
@@ -14,22 +13,30 @@ if (isset($_POST['register'])) {
     $name = mysqli_real_escape_string($conn, $_POST['name']);
     $email = mysqli_real_escape_string($conn, $_POST['email']);
     $semester = mysqli_real_escape_string($conn, $_POST['semester']);
-    $password = password_hash($_POST['password'], PASSWORD_DEFAULT);
+    $password = $_POST['password'];
+    $confirm_password = $_POST['confirm_password'];
 
-    // Check if email or reg_number already exists
-    $check = "SELECT * FROM students WHERE email='$email' OR reg_number='$reg'";
-    $result = mysqli_query($conn, $check);
-
-    if (mysqli_num_rows($result) > 0) {
-        $message = "<p style='color:red;'>Email or Registration Number already exists!</p>";
+    // Check if password and confirm password match
+    if ($password !== $confirm_password) {
+        $message = "<p style='color:red;'>Passwords do not match. Please try again.</p>";
     } else {
-        $sql = "INSERT INTO students (reg_number, name, email, password, semester) 
-                VALUES ('$reg', '$name', '$email', '$password', '$semester')";
+        $hashed_password = password_hash($password, PASSWORD_DEFAULT);
 
-        if (mysqli_query($conn, $sql)) {
-            $message = "<p style='color:green;'>Registration successful. Wait for admin approval.</p>";
+        // Check if email or reg_number already exists
+        $check = "SELECT * FROM students WHERE email='$email' OR reg_number='$reg'";
+        $result = mysqli_query($conn, $check);
+
+        if (mysqli_num_rows($result) > 0) {
+            $message = "<p style='color:red;'>Email or Registration Number already exists!</p>";
         } else {
-            $message = "<p style='color:red;'>Error: " . mysqli_error($conn) . "</p>";
+            $sql = "INSERT INTO students (reg_number, name, email, password, semester) 
+                    VALUES ('$reg', '$name', '$email', '$hashed_password', '$semester')";
+
+            if (mysqli_query($conn, $sql)) {
+                $message = "<p style='color:green;'>Registration successful. Wait for admin approval.</p>";
+            } else {
+                $message = "<p style='color:red;'>Error: " . mysqli_error($conn) . "</p>";
+            }
         }
     }
 }
@@ -61,6 +68,9 @@ if (isset($_POST['register'])) {
 
         <label>Password:</label><br>
         <input type="password" name="password" required><br><br>
+
+        <label>Confirm Password:</label><br>
+        <input type="password" name="confirm_password" required><br><br>
 
         <button type="submit" name="register">Register</button>
     </form>
