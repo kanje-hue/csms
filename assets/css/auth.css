@@ -1,0 +1,102 @@
+:root {
+  --midnight-garden: #5f6f52;
+  --caramelized: #c49a82;
+  --skipping-stones: #8fb3c1;
+  --terra-rosa: #c46a6a;
+  --art-craft: #8a6f5c;
+  --wild-blue: #bfe3f5;
+  --minty-fresh: #d9f2e6;
+  --honey-glow: #f2c66d;
+  --white: #ffffff;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  font-family: "Segoe UI", Tahoma, sans-serif;
+}
+
+body {
+  min-height: 100vh;
+  background: linear-gradient(135deg, var(--wild-blue), var(--minty-fresh));
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.auth-card {
+  width: 420px;
+  background: var(--white);
+  padding: 30px;
+  border-radius: 18px;
+  box-shadow: 0 20px 45px rgba(0,0,0,0.15);
+}
+
+.auth-card h2 {
+  text-align: center;
+  color: var(--midnight-garden);
+  margin-bottom: 8px;
+}
+
+.auth-card p {
+  text-align: center;
+  color: #666;
+  margin-bottom: 25px;
+}
+
+.form-group {
+  margin-bottom: 15px;
+}
+
+.form-group label {
+  display: block;
+  font-size: 14px;
+  color: var(--art-craft);
+  margin-bottom: 6px;
+}
+
+.form-group input,
+.form-group select {
+  width: 100%;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid #ccc;
+  outline: none;
+}
+
+.form-group input:focus,
+.form-group select:focus {
+  border-color: var(--skipping-stones);
+}
+
+.btn {
+  width: 100%;
+  padding: 12px;
+  background: linear-gradient(135deg, var(--terra-rosa), var(--honey-glow));
+  border: none;
+  border-radius: 12px;
+  color: white;
+  font-size: 16px;
+  cursor: pointer;
+}
+
+.btn:hover {
+  opacity: 0.9;
+}
+
+.message {
+  text-align: center;
+  color: var(--terra-rosa);
+  margin-bottom: 12px;
+}
+
+.auth-links {
+  text-align: center;
+  margin-top: 15px;
+}
+
+.auth-links a {
+  color: var(--midnight-garden);
+  text-decoration: none;
+}

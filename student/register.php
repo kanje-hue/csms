@@ -1,80 +1,82 @@
 <?php
-session_start();
-error_reporting(E_ALL);
-ini_set('display_errors', 1);
-
-include '../config/db.php';
-
+include "../config/db.php";
 $message = "";
 
-// Handle form submission
 if (isset($_POST['register'])) {
-    $reg = mysqli_real_escape_string($conn, $_POST['reg_number']);
-    $name = mysqli_real_escape_string($conn, $_POST['name']);
-    $email = mysqli_real_escape_string($conn, $_POST['email']);
-    $semester = mysqli_real_escape_string($conn, $_POST['semester']);
-    $password = $_POST['password'];
-    $confirm_password = $_POST['confirm_password'];
+  $fullname = mysqli_real_escape_string($conn, $_POST['fullname']);
+  $email    = mysqli_real_escape_string($conn, $_POST['email']);
+  $gender   = mysqli_real_escape_string($conn, $_POST['gender']);
+  $course   = mysqli_real_escape_string($conn, $_POST['course']);
+  $password = password_hash($_POST['password'], PASSWORD_DEFAULT);
 
-    // Check if password and confirm password match
-    if ($password !== $confirm_password) {
-        $message = "<p style='color:red;'>Passwords do not match. Please try again.</p>";
+  $check = mysqli_query($conn, "SELECT id FROM students WHERE email='$email'");
+  if (mysqli_num_rows($check) > 0) {
+    $message = "Email already registered!";
+  } else {
+    $sql = "INSERT INTO students (fullname,email,gender,course,password)
+            VALUES ('$fullname','$email','$gender','$course','$password')";
+    if (mysqli_query($conn, $sql)) {
+      $message = "Registration successful!";
     } else {
-        $hashed_password = password_hash($password, PASSWORD_DEFAULT);
-
-        // Check if email or reg_number already exists
-        $check = "SELECT * FROM students WHERE email='$email' OR reg_number='$reg'";
-        $result = mysqli_query($conn, $check);
-
-        if (mysqli_num_rows($result) > 0) {
-            $message = "<p style='color:red;'>Email or Registration Number already exists!</p>";
-        } else {
-            $sql = "INSERT INTO students (reg_number, name, email, password, semester) 
-                    VALUES ('$reg', '$name', '$email', '$hashed_password', '$semester')";
-
-            if (mysqli_query($conn, $sql)) {
-                $message = "<p style='color:green;'>Registration successful. Wait for admin approval.</p>";
-            } else {
-                $message = "<p style='color:red;'>Error: " . mysqli_error($conn) . "</p>";
-            }
-        }
+      $message = "Registration failed!";
     }
+  }
 }
 ?>
 
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Student Registration - CSMS</title>
+  <title>Student Registration</title>
+  <link rel="stylesheet" href="../assets/css/auth.css">
 </head>
 <body>
-    <h2>Student Registration</h2>
 
-    <!-- Show message -->
-    <?php echo $message; ?>
+<div class="auth-card">
+  <h2>Student Registration</h2>
+  <p>Create your account</p>
 
-    <form method="POST" action="">
-        <label>Registration Number:</label><br>
-        <input type="text" name="reg_number" required><br><br>
+  <?php if ($message): ?>
+    <div class="message"><?= $message ?></div>
+  <?php endif; ?>
 
-        <label>Full Name:</label><br>
-        <input type="text" name="name" required><br><br>
+  <form method="POST">
+    <div class="form-group">
+      <label>Full Name</label>
+      <input type="text" name="fullname" required>
+    </div>
 
-        <label>Email:</label><br>
-        <input type="email" name="email" required><br><br>
+    <div class="form-group">
+      <label>Email</label>
+      <input type="email" name="email" required>
+    </div>
 
-        <label>Semester:</label><br>
-        <input type="text" name="semester" required><br><br>
+    <div class="form-group">
+      <label>Gender</label>
+      <select name="gender" required>
+        <option value="">Select</option>
+        <option>Male</option>
+        <option>Female</option>
+      </select>
+    </div>
 
-        <label>Password:</label><br>
-        <input type="password" name="password" required><br><br>
+    <div class="form-group">
+      <label>Course</label>
+      <input type="text" name="course" required>
+    </div>
 
-        <label>Confirm Password:</label><br>
-        <input type="password" name="confirm_password" required><br><br>
+    <div class="form-group">
+      <label>Password</label>
+      <input type="password" name="password" required>
+    </div>
 
-        <button type="submit" name="register">Register</button>
-    </form>
+    <button class="btn" name="register">Register</button>
+  </form>
 
-    <p>Already registered? <a href="login.php">Login here</a></p>
+  <div class="auth-links">
+    <a href="login.php">Already registered? Login</a>
+  </div>
+</div>
+
 </body>
 </html>

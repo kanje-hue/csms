@@ -4,32 +4,22 @@ include '../config/db.php';
 
 $message = "";
 
-// Handle forgot password form submission
 if (isset($_POST['submit_email'])) {
     $email = mysqli_real_escape_string($conn, $_POST['email']);
 
-    // Check if the email exists
     $query = "SELECT * FROM students WHERE email='$email'";
     $result = mysqli_query($conn, $query);
 
     if (mysqli_num_rows($result) == 1) {
-        // Generate a unique token
         $token = bin2hex(random_bytes(50));
-        $expires = date("U") + 1800; // 30 minutes expiry time
+        $expires = date("U") + 1800;
 
-        // Store the token and expiry time in the database
-        $update_query = "UPDATE students SET reset_token='$token', reset_expires='$expires' WHERE email='$email'";
-        if (mysqli_query($conn, $update_query)) {
-            // Send the reset link via email
-            $reset_link = "http://yourdomain.com/reset_password.php?token=" . $token;
-            $subject = "Password Reset Request";
-            $message = "Click on the following link to reset your password: " . $reset_link;
-            mail($email, $subject, $message);
+        $update = "UPDATE students SET reset_token='$token', reset_expires='$expires' WHERE email='$email'";
+        mysqli_query($conn, $update);
 
-            echo "An email has been sent with a password reset link.";
-        }
+        $message = "Password reset token generated (email sending disabled on localhost).";
     } else {
-        echo "Email not found.";
+        $message = "Email not found.";
     }
 }
 ?>
@@ -38,17 +28,22 @@ if (isset($_POST['submit_email'])) {
 <html>
 <head>
     <title>Forgot Password - CSMS</title>
+    <link rel="stylesheet" href="../assets/css/auth.css">
 </head>
 <body>
+
+<div class="auth-card">
     <h2>Forgot Password</h2>
 
-    <!-- Show message -->
-    <?php echo $message; ?>
+    <?php if ($message != "") echo "<div class='message'>$message</div>"; ?>
 
     <form method="POST">
-        <label>Email:</label><br>
-        <input type="email" name="email" required><br><br>
+        <input type="email" name="email" placeholder="Enter your email" required>
         <button type="submit" name="submit_email">Submit</button>
     </form>
+
+    <p><a href="login.php">Back to Login</a></p>
+</div>
+
 </body>
 </html>
