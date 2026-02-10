@@ -1,0 +1,17 @@
+{
+    "name": "lenovo/csms",
+    "autoload": {
+        "psr-4": {
+            "Lenovo\\Csms\\": "src/"
+        }
+    },
+    "authors": [
+        {
+            "name": "scrum group work",
+            "email": "kanjemp@gmail.com"
+        }
+    ],
+    "require": {
+        "phpoffice/phpspreadsheet": "^5.4"
+    }
+}

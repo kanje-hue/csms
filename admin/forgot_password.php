@@ -1,29 +1,24 @@
 <?php
 session_start();
 include '../config/db.php';
+
 $message = "";
 
-if (isset($_POST['submit_email'])) {
-    $email = mysqli_real_escape_string($conn, $_POST['email']);
+if(isset($_POST['submit_email'])){
+    $email = $_POST['email'];
 
-    $check = mysqli_query($conn, "SELECT * FROM students WHERE email='$email'");
-
-    if (mysqli_num_rows($check) === 1) {
+    // Only allow reset for admin email in this demo
+    if($email === "admin@csms.com"){
         $token = bin2hex(random_bytes(32));
         $expires = time() + 1800; // 30 minutes
 
-        mysqli_query(
-            $conn,
-            "UPDATE students 
-             SET reset_token='$token', reset_expires='$expires' 
-             WHERE email='$email'"
-        );
+        $_SESSION['admin_reset_token'] = $token;
+        $_SESSION['admin_reset_expires'] = $expires;
 
-        $message = "Reset link generated. <br>
-        <small>Use this link:</small><br>
+        $message = "Reset link generated:<br>
         <code>reset_password.php?token=$token</code>";
     } else {
-        $message = "Email not found.";
+        $message = "Email not recognized!";
     }
 }
 ?>
@@ -31,8 +26,8 @@ if (isset($_POST['submit_email'])) {
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Forgot Password - CSMS</title>
-    <link rel="stylesheet" href="../assets/css/auth.css">
+    <title>Forgot Password - Admin</title>
+    <link rel="stylesheet" href="../assets/css/admin-auth.css">
 </head>
 <body>
 
@@ -40,7 +35,7 @@ if (isset($_POST['submit_email'])) {
     <h2>Forgot Password</h2>
     <p>We’ll help you reset it</p>
 
-    <?php if ($message): ?>
+    <?php if($message): ?>
         <div class="message"><?= $message ?></div>
     <?php endif; ?>
 

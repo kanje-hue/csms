@@ -1,29 +1,26 @@
 <?php
 session_start();
-include '../config/db.php';
+include "../config/db.php";
+
 $message = "";
 
 if (isset($_POST['submit_email'])) {
-    $email = mysqli_real_escape_string($conn, $_POST['email']);
+    $email = $_POST['email'];
 
-    $check = mysqli_query($conn, "SELECT * FROM students WHERE email='$email'");
-
+    $check = mysqli_query($conn, "SELECT * FROM teachers WHERE email='$email'");
     if (mysqli_num_rows($check) === 1) {
-        $token = bin2hex(random_bytes(32));
-        $expires = time() + 1800; // 30 minutes
 
-        mysqli_query(
-            $conn,
-            "UPDATE students 
-             SET reset_token='$token', reset_expires='$expires' 
-             WHERE email='$email'"
-        );
+        $token   = bin2hex(random_bytes(32));
+        $expires = time() + 1800;
 
-        $message = "Reset link generated. <br>
-        <small>Use this link:</small><br>
+        $_SESSION['teacher_reset_token']   = $token;
+        $_SESSION['teacher_reset_expires'] = $expires;
+        $_SESSION['teacher_reset_email']   = $email;
+
+        $message = "Reset link generated:<br>
         <code>reset_password.php?token=$token</code>";
     } else {
-        $message = "Email not found.";
+        $message = "Email not recognized!";
     }
 }
 ?>
@@ -31,8 +28,8 @@ if (isset($_POST['submit_email'])) {
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Forgot Password - CSMS</title>
-    <link rel="stylesheet" href="../assets/css/auth.css">
+    <title>Forgot Password - Teacher</title>
+    <link rel="stylesheet" href="../assets/css/admin-auth.css">
 </head>
 <body>
 

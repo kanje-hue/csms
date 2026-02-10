@@ -4,21 +4,25 @@ include "../config/db.php";
 
 $message = "";
 
-// Hardcoded admin for demo (can use database later)
-$admin_email = "admin@csms.com";
-$admin_pass_hash = password_hash("admin123", PASSWORD_DEFAULT);
+if (isset($_POST['login'])) {
+    $email = mysqli_real_escape_string($conn, $_POST['email']);
+    $pass  = $_POST['password'];
 
-if(isset($_POST['login'])){
-    $email = $_POST['email'];
-    $password = $_POST['password'];
+    $sql = mysqli_query($conn, "SELECT * FROM teachers WHERE email='$email' AND status='active'");
+    if (mysqli_num_rows($sql) === 1) {
+        $row = mysqli_fetch_assoc($sql);
 
-    if($email === $admin_email && password_verify($password, $admin_pass_hash)){
-        $_SESSION['admin_logged_in'] = true;
-        $_SESSION['admin_email'] = $email;
-        header("Location: dashboard.php");
-        exit();
+        if (password_verify($pass, $row['password'])) {
+            $_SESSION['teacher_id']   = $row['teacher_id'];
+            $_SESSION['teacher_name'] = $row['fullname'];
+
+            header("Location: dashboard.php");
+            exit();
+        } else {
+            $message = "Wrong password!";
+        }
     } else {
-        $message = "Invalid credentials!";
+        $message = "Account not found or inactive!";
     }
 }
 ?>
@@ -26,16 +30,16 @@ if(isset($_POST['login'])){
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Admin Login</title>
+    <title>Teacher Login</title>
     <link rel="stylesheet" href="../assets/css/admin-auth.css">
 </head>
 <body>
 
 <div class="auth-card">
-    <h2>Admin Login</h2>
+    <h2>Teacher Login</h2>
     <p>Welcome back</p>
 
-    <?php if($message): ?>
+    <?php if ($message): ?>
         <div class="message"><?= $message ?></div>
     <?php endif; ?>
 

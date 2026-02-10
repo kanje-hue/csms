@@ -1,24 +1,38 @@
 <?php
 session_start();
 include '../config/db.php';
-
 $message = "";
 
-if (isset($_GET['token'])) {
-    $token = $_GET['token'];
+if (!isset($_GET['token'])) die("No token provided.");
 
-    $query = "SELECT * FROM students WHERE reset_token='$token' AND reset_expires > " . date("U");
-    $result = mysqli_query($conn, $query);
+$token = mysqli_real_escape_string($conn, $_GET['token']);
 
-    if (mysqli_num_rows($result) == 1) {
-        if (isset($_POST['reset_password'])) {
-            $new_password = password_hash($_POST['password'], PASSWORD_DEFAULT);
+$check = mysqli_query(
+    $conn,
+    "SELECT * FROM students 
+     WHERE reset_token='$token' 
+     AND reset_expires > " . time()
+);
 
-            mysqli_query($conn, "UPDATE students SET password='$new_password', reset_token=NULL, reset_expires=NULL WHERE reset_token='$token'");
-            $message = "Password updated successfully.";
-        }
+if (mysqli_num_rows($check) !== 1) die("Invalid or expired token.");
+
+if (isset($_POST['reset_password'])) {
+    $password = $_POST['password'];
+    $confirm  = $_POST['confirm_password'];
+
+    if ($password !== $confirm) {
+        $message = "Passwords do not match!";
     } else {
-        die("Invalid or expired token.");
+        $hash = password_hash($password, PASSWORD_DEFAULT);
+
+        mysqli_query(
+            $conn,
+            "UPDATE students 
+             SET password='$hash', reset_token=NULL, reset_expires=NULL
+             WHERE reset_token='$token'"
+        );
+
+        $message = "Password updated successfully. You can now log in.";
     }
 }
 ?>
@@ -34,12 +48,27 @@ if (isset($_GET['token'])) {
 <div class="auth-card">
     <h2>Reset Password</h2>
 
-    <?php if ($message != "") echo "<div class='message success'>$message</div>"; ?>
+    <?php if ($message): ?>
+        <div class="message"><?= $message ?></div>
+    <?php endif; ?>
 
     <form method="POST">
-        <input type="password" name="password" placeholder="New Password" required>
-        <button type="submit" name="reset_password">Reset Password</button>
+        <div class="form-group">
+            <label>New Password</label>
+            <input type="password" name="password" required>
+        </div>
+
+        <div class="form-group">
+            <label>Confirm Password</label>
+            <input type="password" name="confirm_password" required>
+        </div>
+
+        <button class="btn" name="reset_password">Reset Password</button>
     </form>
+
+    <div class="auth-links">
+        <a href="login.php">Go to Login</a>
+    </div>
 </div>
 
 </body>

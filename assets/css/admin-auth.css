@@ -57,8 +57,7 @@ body {
   margin-bottom: 6px;
 }
 
-.form-group input,
-.form-group select {
+.form-group input {
   width: 100%;
   padding: 12px;
   border-radius: 10px;
@@ -66,8 +65,7 @@ body {
   outline: none;
 }
 
-.form-group input:focus,
-.form-group select:focus {
+.form-group input:focus {
   border-color: var(--skipping-stones);
 }
 
