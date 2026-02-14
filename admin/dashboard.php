@@ -59,14 +59,3 @@ if(!isset($_SESSION['admin_logged_in'])){
     </div>
 </div>
 
-</body>
-</html>
-<ul>
-    <li><a href="manage_students.php">Manage Students</a></li>
-    <li><a href="manage_teachers.php">Manage Teachers</a></li> <!-- Add this line -->
-    <li><a href="#">Manage Courses</a></li>
-    <li><a href="#">Manage Attendance</a></li>
-    <li><a href="#">Manage Results</a></li>
-    <li><a href="logout.php">Logout</a></li>
-</ul>
-<li><a href="manage_teachers.php">Manage Teachers</a></li>
