@@ -1,30 +1,45 @@
 <?php
-// Dashboard for managing students
-
-// Function to fetch pending students count
-function fetch_pending_students_count() {
-    // Database query to get the count of pending students
-    return 10; // Example count
-}
-
-// Count of pending students
-$pending_students_count = fetch_pending_students_count();
+// File: admin/dashboard.php
 ?>
 
-<html>
+<!DOCTYPE html>
+<html lang="en">
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Admin Dashboard</title>
 </head>
 <body>
     <h1>Admin Dashboard</h1>
-    <div>
-        <span>Pending Students: <span style='font-weight:bold;'><?php echo $pending_students_count; ?></span></span>
-        <button onclick='approveStudents()'>Approve Students</button>
-    </div>
+
+    <section>
+        <h2>Statistics</h2>
+        <ul>
+            <li>Total Courses: <?php echo $total_courses; ?></li>
+            <li>Total Teachers: <?php echo $total_teachers; ?></li>
+            <li>Pending Students: <?php echo $total_pending_students; ?></li>
+        </ul>
+    </section>
+
+    <section>
+        <h2>Actions</h2>
+        <button onclick="autoActivate()">Auto-Activate Students</button>
+    </section>
+
+    <nav>
+        <h2>Manage</h2>
+        <ul>
+            <li><a href="manage_courses.php">Manage Courses</a></li>
+            <li><a href="manage_teachers.php">Manage Teachers</a></li>
+            <li><a href="pending_students.php">Pending Students</a></li>
+            <li><a href="auto_activate_students.php">Auto Activate Students</a></li>
+        </ul>
+    </nav>
+
     <script>
-        function approveStudents() {
-            // Logic for approving students
-            alert('Approve functionality not implemented.');
+        function autoActivate() {
+            // Logic to auto-activate students
+            alert('Auto-activation process initiated!');
         }
     </script>
 </body>
