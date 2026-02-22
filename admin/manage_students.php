@@ -15,25 +15,44 @@ if(!$course_id || !$year || !$semester){
     die("Invalid access.");
 }
 
-function safe_int($value) {
-    return filter_var($value, FILTER_VALIDATE_INT);
-}
-
-function safe_string($value) {
-    return htmlspecialchars(trim($value), ENT_QUOTES, 'UTF-8');
-}
-
-function safe_email($value) {
-    return filter_var(trim($value), FILTER_VALIDATE_EMAIL);
-}
-
 if (empty($_SESSION['csrf_token'])) {
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 }
 
 $message = "";
 $message_type = "";
-$search = "";
+
+/* ================= AUTO-ENROLL FUNCTION ================= */
+function auto_enroll_student($conn, $student_id, $course_id, $year, $semester) {
+    try {
+        // Get all modules for this course/year/semester
+        $query = "SELECT module_id FROM modules WHERE course_id = ? AND year = ? AND semester = ? AND deleted = 0";
+        $stmt = $conn->prepare($query);
+        $stmt->bind_param("iii", $course_id, $year, $semester);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        $modules = $result->fetch_all(MYSQLI_ASSOC);
+        $stmt->close();
+        
+        $enrolled_count = 0;
+        
+        // Enroll in each module using INSERT IGNORE
+        foreach($modules as $module) {
+            $module_id = $module['module_id'];
+            $enroll = $conn->prepare("INSERT IGNORE INTO module_enrollments (student_id, module_id, enrolled_at) VALUES (?, ?, NOW())");
+            $enroll->bind_param("ii", $student_id, $module_id);
+            
+            if($enroll->execute()) {
+                $enrolled_count++;
+            }
+            $enroll->close();
+        }
+        
+        return $enrolled_count;
+    } catch(Exception $e) {
+        return 0;
+    }
+}
 
 /* ================= ACTIVATE STUDENT ================= */
 if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'activate'){
@@ -41,17 +60,18 @@ if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['a
         $message = "Security token verification failed";
         $message_type = "error";
     } else {
-        $student_id = safe_int($_POST['student_id'] ?? 0);
+        $student_id = (int)($_POST['student_id'] ?? 0);
         
-        if(!$student_id){
-            $message = "Invalid student ID";
-            $message_type = "error";
-        } else {
+        if($student_id > 0){
+            // Step 1: Update student status to active
             $stmt = $conn->prepare("UPDATE students SET status = 'active' WHERE student_id = ? AND deleted = 0");
             $stmt->bind_param("i", $student_id);
             
-            if($stmt->execute()){
-                $message = "✓ Student activated successfully! They can now login.";
+            if($stmt->execute() && $stmt->affected_rows > 0){
+                // Step 2: Auto-enroll in ALL modules for this course/year/semester
+                $enrolled = auto_enroll_student($conn, $student_id, $course_id, $year, $semester);
+                
+                $message = "✓ Student activated! Auto-enrolled in $enrolled module(s). Students will appear in all teacher's lists.";
                 $message_type = "success";
             } else {
                 $message = "Error activating student";
@@ -68,120 +88,17 @@ if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['a
         $message = "Security token verification failed";
         $message_type = "error";
     } else {
-        $student_id = safe_int($_POST['student_id'] ?? 0);
+        $student_id = (int)($_POST['student_id'] ?? 0);
         
-        if(!$student_id){
-            $message = "Invalid student ID";
-            $message_type = "error";
-        } else {
+        if($student_id > 0){
             $stmt = $conn->prepare("UPDATE students SET status = 'inactive' WHERE student_id = ? AND deleted = 0");
             $stmt->bind_param("i", $student_id);
             
             if($stmt->execute()){
-                $message = "⚠️ Student deactivated. They cannot login anymore.";
+                $message = "⚠️ Student deactivated";
                 $message_type = "success";
-            } else {
-                $message = "Error deactivating student";
-                $message_type = "error";
             }
             $stmt->close();
-        }
-    }
-}
-
-/* ================= ADD STUDENT ================= */
-if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'add'){
-    if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
-        $message = "Security token verification failed";
-        $message_type = "error";
-    } else {
-        $reg_number = safe_string($_POST['reg_number'] ?? '');
-        $name = safe_string($_POST['name'] ?? '');
-        $email = safe_email($_POST['email'] ?? '');
-        $password = $_POST['password'] ?? '';
-        $confirm_password = $_POST['confirm_password'] ?? '';
-
-        if(empty($reg_number) || empty($name) || !$email){
-            $message = "Please fill all required fields";
-            $message_type = "error";
-        } elseif($password !== $confirm_password){
-            $message = "Passwords do not match";
-            $message_type = "error";
-        } elseif(strlen($password) < 6){
-            $message = "Password must be at least 6 characters";
-            $message_type = "error";
-        } else {
-            $check = $conn->prepare("SELECT student_id FROM students WHERE reg_number = ? AND deleted = 0");
-            $check->bind_param("s", $reg_number);
-            $check->execute();
-            
-            if($check->get_result()->num_rows > 0){
-                $message = "Registration number already exists";
-                $message_type = "error";
-            } else {
-                $check_email = $conn->prepare("SELECT student_id FROM students WHERE email = ? AND deleted = 0");
-                $check_email->bind_param("s", $email);
-                $check_email->execute();
-                
-                if($check_email->get_result()->num_rows > 0){
-                    $message = "Email already registered";
-                    $message_type = "error";
-                } else {
-                    $password_hash = password_hash($password, PASSWORD_DEFAULT);
-                    $stmt = $conn->prepare("INSERT INTO students (reg_number, name, email, password, course_id, year, semester, status, deleted, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 0, NOW())");
-                    $stmt->bind_param("ssssiii", $reg_number, $name, $email, $password_hash, $course_id, $year, $semester);
-                    
-                    if($stmt->execute()){
-                        $message = "Student created successfully";
-                        $message_type = "success";
-                    } else {
-                        $message = "Error creating student";
-                        $message_type = "error";
-                    }
-                    $stmt->close();
-                }
-                $check_email->close();
-            }
-            $check->close();
-        }
-    }
-}
-
-/* ================= UPDATE STUDENT ================= */
-if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'update'){
-    if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
-        $message = "Security token verification failed";
-        $message_type = "error";
-    } else {
-        $student_id = safe_int($_POST['student_id'] ?? 0);
-        $name = safe_string($_POST['name'] ?? '');
-        $email = safe_email($_POST['email'] ?? '');
-
-        if(!$student_id || empty($name) || !$email){
-            $message = "Please fill all required fields";
-            $message_type = "error";
-        } else {
-            $check = $conn->prepare("SELECT student_id FROM students WHERE email = ? AND student_id != ? AND deleted = 0");
-            $check->bind_param("si", $email, $student_id);
-            $check->execute();
-            
-            if($check->get_result()->num_rows > 0){
-                $message = "Email is already used";
-                $message_type = "error";
-            } else {
-                $stmt = $conn->prepare("UPDATE students SET name = ?, email = ? WHERE student_id = ? AND deleted = 0");
-                $stmt->bind_param("ssi", $name, $email, $student_id);
-                
-                if($stmt->execute()){
-                    $message = "Student updated successfully";
-                    $message_type = "success";
-                } else {
-                    $message = "Error updating student";
-                    $message_type = "error";
-                }
-                $stmt->close();
-            }
-            $check->close();
         }
     }
 }
@@ -192,103 +109,56 @@ if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['a
         $message = "Security token verification failed";
         $message_type = "error";
     } else {
-        $student_id = safe_int($_POST['student_id'] ?? 0);
+        $student_id = (int)($_POST['student_id'] ?? 0);
         
-        if(!$student_id){
-            $message = "Invalid student ID";
-            $message_type = "error";
-        } else {
+        if($student_id > 0){
             $stmt = $conn->prepare("UPDATE students SET deleted = 1 WHERE student_id = ?");
             $stmt->bind_param("i", $student_id);
             
             if($stmt->execute()){
-                $message = "Student deleted successfully";
+                $message = "Student deleted";
                 $message_type = "success";
-            } else {
-                $message = "Error deleting student";
-                $message_type = "error";
             }
             $stmt->close();
         }
     }
 }
 
-/* ================= RESTORE STUDENT ================= */
-if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'restore'){
-    if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
-        $message = "Security token verification failed";
-        $message_type = "error";
-    } else {
-        $student_id = safe_int($_POST['student_id'] ?? 0);
-        
-        if(!$student_id){
-            $message = "Invalid student ID";
-            $message_type = "error";
-        } else {
-            $stmt = $conn->prepare("UPDATE students SET deleted = 0 WHERE student_id = ?");
-            $stmt->bind_param("i", $student_id);
-            
-            if($stmt->execute()){
-                $message = "Student restored successfully";
-                $message_type = "success";
-            } else {
-                $message = "Error restoring student";
-                $message_type = "error";
-            }
-            $stmt->close();
-        }
-    }
-}
+/* ================= FETCH DATA ================= */
 
-/* ================= PAGINATION ================= */
-$page = isset($_GET['page']) ? safe_int($_GET['page']) : 1;
-if (!$page) $page = 1;
-
-$limit = 15;
-$offset = ($page - 1) * $limit;
-
-$search_term = null;
-$where = "WHERE deleted = 0 AND course_id = ? AND year = ? AND semester = ?";
-
-if (isset($_GET['search']) && !empty($_GET['search'])) {
-    $search = safe_string($_GET['search']);
-    $search_term = "%" . $search . "%";
-    $where .= " AND (name LIKE ? OR email LIKE ? OR reg_number LIKE ?)";
-}
-
-$count_query = "SELECT COUNT(*) as total FROM students $where";
-$count_stmt = $conn->prepare($count_query);
-
-if ($search_term) {
-    $count_stmt->bind_param("iiisss", $course_id, $year, $semester, $search_term, $search_term, $search_term);
-} else {
-    $count_stmt->bind_param("iii", $course_id, $year, $semester);
-}
-$count_stmt->execute();
-$total = $count_stmt->get_result()->fetch_assoc()['total'];
-$pages = ceil($total / $limit);
-$count_stmt->close();
-
-$query = "SELECT student_id, reg_number, name, email, status, deleted FROM students $where ORDER BY name ASC LIMIT ?, ?";
-
-$stmt = $conn->prepare($query);
-
-if ($search_term) {
-    $stmt->bind_param("iiissssii", $course_id, $year, $semester, $search_term, $search_term, $search_term, $limit, $offset);
-} else {
-    $stmt->bind_param("iiiii", $course_id, $year, $semester, $limit, $offset);
-}
-
-$stmt->execute();
-$students = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-$stmt->close();
-
-$course_stmt = $conn->prepare("SELECT course_name FROM courses WHERE course_id = ?");
+// Get course name
+$course_stmt = $conn->prepare("SELECT course_name FROM courses WHERE course_id = ? AND deleted = 0");
 $course_stmt->bind_param("i", $course_id);
 $course_stmt->execute();
 $course_result = $course_stmt->get_result()->fetch_assoc();
 $course_name = $course_result ? $course_result['course_name'] : 'Unknown';
 $course_stmt->close();
+
+// Fetch pending students
+$pending_query = "SELECT student_id, reg_number, name, email, created_at 
+                  FROM students 
+                  WHERE deleted = 0 AND course_id = ? AND year = ? AND semester = ? AND status = 'pending' 
+                  ORDER BY created_at DESC";
+$pending_stmt = $conn->prepare($pending_query);
+$pending_stmt->bind_param("iii", $course_id, $year, $semester);
+$pending_stmt->execute();
+$pending_students = $pending_stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$pending_stmt->close();
+
+// Fetch ALL students 
+$student_query = "SELECT student_id, reg_number, name, email, status, created_at
+                  FROM students 
+                  WHERE deleted = 0 AND course_id = ? AND year = ? AND semester = ?
+                  ORDER BY status DESC, name ASC";
+$student_stmt = $conn->prepare($student_query);
+$student_stmt->bind_param("iii", $course_id, $year, $semester);
+$student_stmt->execute();
+$all_students = $student_stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$student_stmt->close();
+
+// Separate active and inactive
+$active_students = array_filter($all_students, function($s) { return $s['status'] === 'active'; });
+$inactive_students = array_filter($all_students, function($s) { return $s['status'] === 'inactive'; });
 
 ?>
 
@@ -312,6 +182,14 @@ $course_stmt->close();
             text-align: center;
             margin-bottom: 15px;
             color: var(--midnight-garden);
+        }
+
+        h3 {
+            margin-top: 30px;
+            margin-bottom: 15px;
+            color: var(--midnight-garden);
+            border-bottom: 2px solid var(--minty-fresh);
+            padding-bottom: 10px;
         }
 
         .breadcrumb {
@@ -342,69 +220,30 @@ $course_stmt->close();
             border: 1px solid #f5c6cb;
         }
 
-        .search-box {
-            display: flex;
-            gap: 10px;
-            margin-bottom: 20px;
-            justify-content: center;
-            flex-wrap: wrap;
-        }
-
-        .search-box input {
-            padding: 8px 12px;
-            border: 1px solid #ddd;
-            border-radius: 8px;
-            font-size: 14px;
-            min-width: 300px;
-        }
-
-        .search-box button {
-            padding: 8px 15px;
-            background: var(--terra-rosa);
-            color: white;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            font-weight: bold;
-        }
-
-        .search-box button:hover {
-            opacity: 0.9;
-        }
-
         table {
             width: 100%;
             border-collapse: collapse;
             margin-top: 20px;
-            table-layout: fixed;
         }
 
         th, td {
-            padding: 10px;
-            border: 1px solid #566947;
-            text-align: center;
-            word-wrap: break-word;
+            padding: 12px;
+            border: 1px solid #ddd;
+            text-align: left;
         }
 
         th {
             background: var(--minty-fresh);
             color: var(--art-craft);
-        }
-
-        td:first-child, th:first-child {
-            text-align: left;
-        }
-
-        a.action-link {
-            color: var(--terra-rosa);
             font-weight: bold;
-            text-decoration: none;
-            margin: 0 5px;
-            cursor: pointer;
         }
 
-        a.action-link:hover {
-            opacity: 0.8;
+        tr:nth-child(even) {
+            background: #f9f9f9;
+        }
+
+        tr:hover {
+            background: #f0f0f0;
         }
 
         .badge {
@@ -430,17 +269,35 @@ $course_stmt->close();
             color: #856404;
         }
 
-        .badge-deleted {
-            background: #f8d7da;
-            color: #721c24;
-        }
-
-        .auth-links {
-            text-align: center;
-            margin-top: 15px;
-        }
-
         .btn {
+            background: none;
+            border: none;
+            color: var(--terra-rosa);
+            font-weight: bold;
+            cursor: pointer;
+            text-decoration: underline;
+            margin: 0 5px;
+            padding: 0;
+            font-size: 14px;
+        }
+
+        .btn:hover {
+            opacity: 0.8;
+        }
+
+        .btn.danger {
+            color: #f44336;
+        }
+
+        .btn.success {
+            color: #4CAF50;
+        }
+
+        .btn.warning {
+            color: #FF9800;
+        }
+
+        .back-btn {
             display: inline-block;
             padding: 8px 15px;
             background: linear-gradient(135deg, var(--terra-rosa), var(--honey-glow));
@@ -449,20 +306,18 @@ $course_stmt->close();
             text-decoration: none;
             font-weight: bold;
             margin-bottom: 10px;
-            border: none;
-            cursor: pointer;
         }
 
-        .btn:hover {
+        .back-btn:hover {
             opacity: 0.9;
         }
 
-        .add-btn {
-            float: left;
-        }
-
-        .back-btn {
-            float: right;
+        .pending-section {
+            background: #cce5ff;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border-left: 4px solid #004085;
         }
 
         .no-data {
@@ -471,142 +326,14 @@ $course_stmt->close();
             color: #666;
         }
 
-        .pagination {
-            text-align: center;
-            margin-top: 20px;
-            padding: 10px;
-        }
-
-        .pagination a, .pagination span {
-            padding: 5px 10px;
-            margin: 0 3px;
-            border: 1px solid #ddd;
-            border-radius: 5px;
-            text-decoration: none;
-            color: #333;
-        }
-
-        .pagination a:hover {
-            background: #f0f0f0;
-        }
-
-        .pagination span.active {
-            background: var(--terra-rosa);
+        .count-badge {
+            background: #FF6B6B;
             color: white;
-            border-color: var(--terra-rosa);
-        }
-
-        /* Modal */
-        .modal {
-            display: none;
-            position: fixed;
-            z-index: 1000;
-            left: 0;
-            top: 0;
-            width: 100%;
-            height: 100%;
-            background-color: rgba(0,0,0,0.4);
-        }
-
-        .modal.show {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-
-        .modal-content {
-            background-color: var(--white);
-            padding: 25px;
+            padding: 2px 8px;
             border-radius: 12px;
-            width: 90%;
-            max-width: 500px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            max-height: 90vh;
-            overflow-y: auto;
-        }
-
-        .modal-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 20px;
-        }
-
-        .modal-header h3 {
-            margin: 0;
-            color: var(--midnight-garden);
-        }
-
-        .close-btn {
-            background: none;
-            border: none;
-            font-size: 24px;
-            cursor: pointer;
-            color: #999;
-        }
-
-        .close-btn:hover {
-            color: #000;
-        }
-
-        .form-group {
-            margin-bottom: 15px;
-        }
-
-        .form-group label {
-            display: block;
-            margin-bottom: 5px;
+            font-size: 12px;
             font-weight: bold;
-            color: var(--midnight-garden);
-        }
-
-        .form-group input,
-        .form-group select {
-            width: 100%;
-            padding: 8px;
-            border: 1px solid #ddd;
-            border-radius: 8px;
-            font-size: 14px;
-            box-sizing: border-box;
-        }
-
-        .form-group input:focus,
-        .form-group select:focus {
-            outline: none;
-            border-color: var(--terra-rosa);
-        }
-
-        .form-actions {
-            display: flex;
-            gap: 10px;
-            margin-top: 20px;
-        }
-
-        .form-actions button {
-            flex: 1;
-            padding: 10px;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            font-weight: bold;
-        }
-
-        .btn-submit {
-            background: linear-gradient(135deg, var(--terra-rosa), var(--honey-glow));
-            color: white;
-        }
-
-        .btn-submit:hover {
-            opacity: 0.9;
-        }
-
-        .btn-cancel {
-            background: #999;
-            color: white;
-        }
-
-        .btn-cancel:hover {
-            opacity: 0.9;
+            margin-left: 10px;
         }
 
         @media (max-width: 768px) {
@@ -621,25 +348,6 @@ $course_stmt->close();
 
             th, td {
                 padding: 8px;
-            }
-
-            .search-box {
-                flex-direction: column;
-            }
-
-            .search-box input {
-                min-width: 100%;
-            }
-
-            .add-btn, .back-btn {
-                float: none;
-                display: block;
-                width: 100%;
-                text-align: center;
-            }
-
-            .modal-content {
-                width: 95%;
             }
         }
     </style>
@@ -659,216 +367,137 @@ $course_stmt->close();
         </div>
     <?php endif; ?>
 
-    <button onclick="openAddModal()" class="btn add-btn">+ Add Student</button>
-    <a href="manage_courses.php" class="btn back-btn">← Back</a>
+    <a href="manage_courses.php" class="back-btn">← Back</a>
     <div style="clear: both;"></div>
 
-    <div class="search-box">
-        <form method="GET" style="display: flex; gap: 10px; width: 100%;">
-            <input type="hidden" name="course_id" value="<?= $course_id ?>">
-            <input type="hidden" name="year" value="<?= $year ?>">
-            <input type="hidden" name="semester" value="<?= $semester ?>">
-            <input type="text" name="search" placeholder="Search by name, email, or reg number..." value="<?= htmlspecialchars($search) ?>">
-            <button type="submit">🔍 Search</button>
-            <?php if(!empty($search)): ?>
-                <a href="?course_id=<?= $course_id ?>&year=<?= $year ?>&semester=<?= $semester ?>" style="padding: 8px 15px; background: #999; color: white; text-decoration: none; border-radius: 8px;">Clear</a>
-            <?php endif; ?>
-        </form>
-    </div>
-
-    <?php if (count($students) > 0): ?>
-        <table>
-            <tr>
-                <th>Reg Number</th>
-                <th>Name</th>
-                <th>Email</th>
-                <th>Status</th>
-                <th>Actions</th>
-            </tr>
-
-            <?php foreach ($students as $student): ?>
-            <tr>
-                <td><?= htmlspecialchars($student['reg_number']) ?></td>
-                <td><?= htmlspecialchars($student['name']) ?></td>
-                <td><?= htmlspecialchars($student['email']) ?></td>
-                <td>
-                    <span class="badge badge-<?= $student['deleted'] ? 'deleted' : $student['status'] ?>">
-                        <?php 
-                            if($student['deleted']) {
-                                echo '🗑️ Deleted';
-                            } elseif($student['status'] === 'active') {
-                                echo '✓ Active';
-                            } elseif($student['status'] === 'pending') {
-                                echo '⏳ Pending';
-                            } else {
-                                echo '⚠️ Inactive';
-                            }
-                        ?>
-                    </span>
-                </td>
-                <td>
-                    <?php if (!$student['deleted']): ?>
-                        <?php if ($student['status'] !== 'active'): ?>
+    <!-- PENDING STUDENTS -->
+    <?php if (count($pending_students) > 0): ?>
+        <div class="pending-section">
+            <h3 style="margin-top: 0; color: #004085;">⏳ Pending Approvals <span class="count-badge"><?= count($pending_students) ?></span></h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Reg Number</th>
+                        <th>Name</th>
+                        <th>Email</th>
+                        <th>Registered</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($pending_students as $s): ?>
+                    <tr style="background: #e3f2fd;">
+                        <td><strong><?= htmlspecialchars($s['reg_number']) ?></strong></td>
+                        <td><?= htmlspecialchars($s['name']) ?></td>
+                        <td><?= htmlspecialchars($s['email']) ?></td>
+                        <td><?= date('M d, Y', strtotime($s['created_at'])) ?></td>
+                        <td>
                             <form method="POST" style="display: inline;">
                                 <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
                                 <input type="hidden" name="action" value="activate">
-                                <input type="hidden" name="student_id" value="<?= $student['student_id'] ?>">
-                                <a class="action-link" onclick="this.parentForm.submit();">Activate</a>
+                                <input type="hidden" name="student_id" value="<?= $s['student_id'] ?>">
+                                <button type="submit" class="btn success">✓ Activate</button>
                             </form>
-                        <?php else: ?>
                             <form method="POST" style="display: inline;">
                                 <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
-                                <input type="hidden" name="action" value="deactivate">
-                                <input type="hidden" name="student_id" value="<?= $student['student_id'] ?>">
-                                <a class="action-link" onclick="this.parentForm.submit();">Deactivate</a>
+                                <input type="hidden" name="action" value="delete">
+                                <input type="hidden" name="student_id" value="<?= $s['student_id'] ?>">
+                                <button type="submit" class="btn danger" onclick="return confirm('Reject this registration?');">✗ Reject</button>
                             </form>
-                        <?php endif; ?>
-                        
-                        <a class="action-link" onclick="openEditModal(<?= htmlspecialchars(json_encode($student)) ?>)">Edit</a>
-                        
-                        <form method="POST" style="display: inline;">
-                            <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
-                            <input type="hidden" name="action" value="delete">
-                            <input type="hidden" name="student_id" value="<?= $student['student_id'] ?>">
-                            <a class="action-link" onclick="if(confirm('Delete this student?')) this.parentForm.submit(); return false;">Delete</a>
-                        </form>
-                    <?php else: ?>
-                        <form method="POST" style="display: inline;">
-                            <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
-                            <input type="hidden" name="action" value="restore">
-                            <input type="hidden" name="student_id" value="<?= $student['student_id'] ?>">
-                            <a class="action-link" onclick="this.parentForm.submit();">Restore</a>
-                        </form>
-                    <?php endif; ?>
-                </td>
-            </tr>
-            <?php endforeach; ?>
-        </table>
-
-        <?php if ($pages > 1): ?>
-            <div class="pagination">
-                <?php if ($page > 1): ?>
-                    <a href="?course_id=<?= $course_id ?>&year=<?= $year ?>&semester=<?= $semester ?>&page=1<?= !empty($search) ? '&search=' . urlencode($search) : '' ?>">« First</a>
-                    <a href="?course_id=<?= $course_id ?>&year=<?= $year ?>&semester=<?= $semester ?>&page=<?= $page - 1 ?><?= !empty($search) ? '&search=' . urlencode($search) : '' ?>">‹ Previous</a>
-                <?php endif; ?>
-
-                <?php for ($i = max(1, $page - 2); $i <= min($pages, $page + 2); $i++): ?>
-                    <?php if ($i === $page): ?>
-                        <span class="active"><?= $i ?></span>
-                    <?php else: ?>
-                        <a href="?course_id=<?= $course_id ?>&year=<?= $year ?>&semester=<?= $semester ?>&page=<?= $i ?><?= !empty($search) ? '&search=' . urlencode($search) : '' ?>"><?= $i ?></a>
-                    <?php endif; ?>
-                <?php endfor; ?>
-
-                <?php if ($page < $pages): ?>
-                    <a href="?course_id=<?= $course_id ?>&year=<?= $year ?>&semester=<?= $semester ?>&page=<?= $page + 1 ?><?= !empty($search) ? '&search=' . urlencode($search) : '' ?>">Next ›</a>
-                    <a href="?course_id=<?= $course_id ?>&year=<?= $year ?>&semester=<?= $semester ?>&page=<?= $pages ?><?= !empty($search) ? '&search=' . urlencode($search) : '' ?>">Last »</a>
-                <?php endif; ?>
-            </div>
-        <?php endif; ?>
-    <?php else: ?>
-        <div class="no-data">
-            <p>No students found for this course/year/semester combination.</p>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
         </div>
     <?php endif; ?>
 
-    <div class="auth-links">
-        <a href="manage_courses.php">Back to Dashboard</a>
+    <!-- ACTIVE STUDENTS -->
+    <h3>✓ Active Students <span class="count-badge"><?= count($active_students) ?></span></h3>
+    <?php if (count($active_students) > 0): ?>
+        <table>
+            <thead>
+                <tr>
+                    <th>Reg Number</th>
+                    <th>Name</th>
+                    <th>Email</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($active_students as $s): ?>
+                <tr>
+                    <td><strong><?= htmlspecialchars($s['reg_number']) ?></strong></td>
+                    <td><?= htmlspecialchars($s['name']) ?></td>
+                    <td><?= htmlspecialchars($s['email']) ?></td>
+                    <td><span class="badge badge-active">✓ Active</span></td>
+                    <td>
+                        <form method="POST" style="display: inline;">
+                            <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+                            <input type="hidden" name="action" value="deactivate">
+                            <input type="hidden" name="student_id" value="<?= $s['student_id'] ?>">
+                            <button type="submit" class="btn warning">Deactivate</button>
+                        </form>
+                        <form method="POST" style="display: inline;">
+                            <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+                            <input type="hidden" name="action" value="delete">
+                            <input type="hidden" name="student_id" value="<?= $s['student_id'] ?>">
+                            <button type="submit" class="btn danger" onclick="return confirm('Delete this student?');">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    <?php else: ?>
+        <div class="no-data">No active students</div>
+    <?php endif; ?>
+
+    <!-- INACTIVE STUDENTS -->
+    <?php if (count($inactive_students) > 0): ?>
+        <h3>⚠️ Inactive Students <span class="count-badge"><?= count($inactive_students) ?></span></h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Reg Number</th>
+                    <th>Name</th>
+                    <th>Email</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($inactive_students as $s): ?>
+                <tr>
+                    <td><strong><?= htmlspecialchars($s['reg_number']) ?></strong></td>
+                    <td><?= htmlspecialchars($s['name']) ?></td>
+                    <td><?= htmlspecialchars($s['email']) ?></td>
+                    <td><span class="badge badge-inactive">⚠️ Inactive</span></td>
+                    <td>
+                        <form method="POST" style="display: inline;">
+                            <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+                            <input type="hidden" name="action" value="activate">
+                            <input type="hidden" name="student_id" value="<?= $s['student_id'] ?>">
+                            <button type="submit" class="btn success">Activate</button>
+                        </form>
+                        <form method="POST" style="display: inline;">
+                            <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+                            <input type="hidden" name="action" value="delete">
+                            <input type="hidden" name="student_id" value="<?= $s['student_id'] ?>">
+                            <button type="submit" class="btn danger" onclick="return confirm('Delete this student?');">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    <?php endif; ?>
+
+    <div style="text-align: center; margin-top: 30px;">
+        <a href="manage_courses.php">← Back to Dashboard</a>
     </div>
 </div>
-
-<!-- Modal -->
-<div id="studentModal" class="modal">
-    <div class="modal-content">
-        <div class="modal-header">
-            <h3 id="modalTitle">Add Student</h3>
-            <button class="close-btn" onclick="closeModal()">×</button>
-        </div>
-
-        <form id="studentForm" method="POST">
-            <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
-            <input type="hidden" name="action" id="formAction" value="add">
-            <input type="hidden" name="student_id" id="studentId" value="">
-
-            <div class="form-group">
-                <label for="regNumber">Registration Number *</label>
-                <input type="text" id="regNumber" name="reg_number" required>
-            </div>
-
-            <div class="form-group">
-                <label for="name">Full Name *</label>
-                <input type="text" id="name" name="name" required>
-            </div>
-
-            <div class="form-group">
-                <label for="email">Email *</label>
-                <input type="email" id="email" name="email" required>
-            </div>
-
-            <div id="passwordRow">
-                <div class="form-group">
-                    <label for="password">Password *</label>
-                    <input type="password" id="password" name="password" required>
-                </div>
-
-                <div class="form-group">
-                    <label for="confirmPassword">Confirm Password *</label>
-                    <input type="password" id="confirmPassword" name="confirm_password" required>
-                </div>
-            </div>
-
-            <div class="form-actions">
-                <button type="submit" class="btn-submit">Save</button>
-                <button type="button" class="btn-cancel" onclick="closeModal()">Cancel</button>
-            </div>
-        </form>
-    </div>
-</div>
-
-<script>
-function openAddModal() {
-    document.getElementById('modalTitle').textContent = 'Add Student';
-    document.getElementById('formAction').value = 'add';
-    document.getElementById('studentId').value = '';
-    document.getElementById('regNumber').value = '';
-    document.getElementById('name').value = '';
-    document.getElementById('email').value = '';
-    document.getElementById('password').value = '';
-    document.getElementById('password').required = true;
-    document.getElementById('confirmPassword').value = '';
-    document.getElementById('confirmPassword').required = true;
-    document.getElementById('passwordRow').style.display = 'block';
-    document.getElementById('studentModal').classList.add('show');
-}
-
-function openEditModal(student) {
-    document.getElementById('modalTitle').textContent = 'Edit Student';
-    document.getElementById('formAction').value = 'update';
-    document.getElementById('studentId').value = student.student_id;
-    document.getElementById('regNumber').value = student.reg_number;
-    document.getElementById('regNumber').disabled = true;
-    document.getElementById('name').value = student.name;
-    document.getElementById('email').value = student.email;
-    document.getElementById('password').value = '';
-    document.getElementById('password').required = false;
-    document.getElementById('confirmPassword').value = '';
-    document.getElementById('confirmPassword').required = false;
-    document.getElementById('passwordRow').style.display = 'none';
-    document.getElementById('studentModal').classList.add('show');
-}
-
-function closeModal() {
-    document.getElementById('studentModal').classList.remove('show');
-    document.getElementById('regNumber').disabled = false;
-}
-
-window.onclick = function(event) {
-    const modal = document.getElementById('studentModal');
-    if (event.target === modal) {
-        modal.classList.remove('show');
-    }
-}
-</script>
 
 </body>
 </html>

@@ -1,10 +1,6 @@
 <?php
 session_start();
 include '../config/db.php';
-require '../vendor/autoload.php'; // PhpSpreadsheet
-use PhpOffice\PhpSpreadsheet\Spreadsheet;
-use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
-use PhpOffice\PhpSpreadsheet\IOFactory;
 
 if(!isset($_SESSION['teacher_id'])){
     header("Location: login.php");
@@ -12,102 +8,27 @@ if(!isset($_SESSION['teacher_id'])){
 }
 
 $teacher_id = $_SESSION['teacher_id'];
-$message = "";
-$errors = [];
+$teacher_name = $_SESSION['teacher_name'] ?? 'Teacher';
 
-/* ============================
-   Generate & download Excel template
-============================ */
-if(isset($_POST['download_template']) && isset($_POST['module_id'])){
-    $module_id = (int)$_POST['module_id'];
+// Get teacher's modules
+$modules_query = "SELECT module_id, module_code, module_name, course_id FROM modules WHERE teacher_id = ? AND deleted = 0 ORDER BY module_code ASC";
+$modules_stmt = $conn->prepare($modules_query);
+$modules_stmt->bind_param("i", $teacher_id);
+$modules_stmt->execute();
+$modules_result = $modules_stmt->get_result();
+$modules = $modules_result->fetch_all(MYSQLI_ASSOC);
+$modules_stmt->close();
 
-    $students = mysqli_query($conn, "
-        SELECT s.email, s.name
-        FROM module_registrations mr
-        JOIN students s ON mr.student_id = s.student_id
-        WHERE mr.module_id = $module_id
-    ");
-
-    $spreadsheet = new Spreadsheet();
-    $sheet = $spreadsheet->getActiveSheet();
-    $sheet->setCellValue('A1','student_email');
-    $sheet->setCellValue('B1','marks');
-    $sheet->setCellValue('C1','grade');
-
-    $row_num = 2;
-    while($s = mysqli_fetch_assoc($students)){
-        $sheet->setCellValue("A$row_num", $s['email']);
-        $sheet->setCellValue("B$row_num", "");
-        $sheet->setCellValue("C$row_num", "");
-        $row_num++;
-    }
-
-    $writer = new Xlsx($spreadsheet);
-    header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    header('Content-Disposition: attachment;filename="module_'.$module_id.'_template.xlsx"');
-    header('Cache-Control: max-age=0');
-    $writer->save('php://output');
-    exit();
+// Get course names for each module
+foreach($modules as &$m){
+    $course_stmt = $conn->prepare("SELECT course_name FROM courses WHERE course_id = ?");
+    $course_stmt->bind_param("i", $m['course_id']);
+    $course_stmt->execute();
+    $course = $course_stmt->get_result()->fetch_assoc();
+    $m['course_name'] = $course ? $course['course_name'] : 'Unknown';
+    $course_stmt->close();
 }
 
-/* ============================
-   Upload Excel with results
-============================ */
-if(isset($_POST['upload_excel']) && isset($_FILES['excel_file'])){
-    $file = $_FILES['excel_file']['tmp_name'];
-    $module_id = (int)$_POST['module_id'];
-
-    $spreadsheet = IOFactory::load($file);
-    $sheet = $spreadsheet->getActiveSheet();
-    $rows = $sheet->toArray();
-
-    for($i=1; $i<count($rows); $i++){
-        $row = $rows[$i];
-        $student_email = trim($row[0]);
-        $marks = (int)$row[1];
-        $grade = trim($row[2]);
-
-        if(empty($student_email) || $marks < 0 || $marks > 100 || empty($grade)){
-            $errors[] = "Row ".($i+1)." has invalid data.";
-            continue;
-        }
-
-        $student_res = mysqli_query($conn, "SELECT student_id FROM students WHERE email='$student_email'");
-        if(mysqli_num_rows($student_res) !== 1){
-            $errors[] = "Row ".($i+1).": student email '$student_email' not found.";
-            continue;
-        }
-        $student_id = mysqli_fetch_assoc($student_res)['student_id'];
-
-        $check_reg = mysqli_query($conn, "SELECT * FROM module_registrations WHERE student_id=$student_id AND module_id=$module_id");
-        if(mysqli_num_rows($check_reg) === 0){
-            $errors[] = "Row ".($i+1).": student not registered in this module.";
-            continue;
-        }
-
-        $check_result = mysqli_query($conn, "SELECT * FROM results WHERE student_id=$student_id AND module_id=$module_id");
-        if(mysqli_num_rows($check_result) > 0){
-            mysqli_query($conn, "UPDATE results SET marks=$marks, grade='$grade' WHERE student_id=$student_id AND module_id=$module_id");
-        } else {
-            mysqli_query($conn, "INSERT INTO results (student_id,module_id,marks,grade) VALUES ($student_id,$module_id,$marks,'$grade')");
-        }
-    }
-
-    if(empty($errors)){
-        $message = "Excel uploaded successfully!";
-    }
-}
-
-/* ============================
-   Fetch teacher's modules
-============================ */
-$modules = mysqli_query($conn, "
-    SELECT m.module_id, m.module_code, m.module_name, c.course_name
-    FROM modules m
-    JOIN courses c ON m.course_id = c.course_id
-    WHERE m.teacher_id=$teacher_id
-    ORDER BY m.semester, m.module_name ASC
-");
 ?>
 
 <!DOCTYPE html>
@@ -116,109 +37,355 @@ $modules = mysqli_query($conn, "
     <title>Teacher Dashboard</title>
     <link rel="stylesheet" href="../assets/css/auth.css">
     <style>
-        .auth-card.admin { width:950px; margin:50px auto; padding:25px; border-radius:18px; background:var(--white); box-shadow:0 20px 45px rgba(0,0,0,0.15); }
-        h2 { text-align:center; color:var(--midnight-garden); margin-bottom:10px; }
-        h3 { color:var(--midnight-garden); margin-top:20px; }
-
-        /* Top dashboard cards like admin */
-        .dashboard-container {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 15px;
-            justify-content: center;
-            margin-bottom: 25px;
-        }
-        .card {
-            width: 200px;
-            height: 80px;
-            background: linear-gradient(135deg, var(--skipping-stones), var(--minty-fresh));
+        .auth-card {
+            width: 1100px;
+            max-width: 100%;
+            padding: 30px;
             border-radius: 18px;
-            box-shadow: 0 15px 30px rgba(0,0,0,0.15);
+            background: var(--white);
+            box-shadow: 0 20px 45px rgba(0,0,0,0.15);
+            margin: 30px auto;
+        }
+
+        h2 {
+            text-align: center;
+            color: var(--midnight-garden);
+            margin-bottom: 10px;
+        }
+
+        .welcome {
+            text-align: center;
+            color: #666;
+            font-size: 16px;
+            margin-bottom: 30px;
+        }
+
+        h3 {
+            margin-top: 30px;
+            margin-bottom: 20px;
+            color: var(--midnight-garden);
+            border-bottom: 2px solid var(--minty-fresh);
+            padding-bottom: 10px;
+        }
+
+        .modules-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+
+        .module-card {
+            background: linear-gradient(135deg, var(--skipping-stones), var(--minty-fresh));
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            transition: all 0.3s;
+        }
+
+        .module-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 20px rgba(0,0,0,0.15);
+        }
+
+        .module-card h4 {
+            color: var(--midnight-garden);
+            margin-top: 0;
+            margin-bottom: 10px;
+            font-size: 18px;
+        }
+
+        .module-code {
+            color: var(--terra-rosa);
+            font-weight: bold;
+            font-size: 14px;
+        }
+
+        .module-course {
+            color: #666;
+            font-size: 13px;
+            margin-bottom: 15px;
+        }
+
+        .action-buttons {
             display: flex;
-            justify-content: center;
-            align-items: center;
-            color: var(--art-craft);
+            flex-direction: column;
+            gap: 8px;
+            margin-top: 15px;
+        }
+
+        .action-link {
+            display: block;
+            padding: 10px 15px;
+            background: linear-gradient(135deg, var(--terra-rosa), var(--honey-glow));
+            color: white;
             text-decoration: none;
             font-weight: bold;
-            font-size: 16px;
-            cursor: pointer;
-            transition: transform 0.2s;
+            border-radius: 8px;
+            text-align: center;
+            transition: all 0.3s;
+            font-size: 13px;
         }
-        .card:hover { transform: scale(1.05); }
 
-        table { width:100%; border-collapse:collapse; margin-top:10px; }
-        th, td { padding:10px; border:1px solid #566947; text-align:center; }
-        th { background: var(--minty-fresh); }
-        tr:nth-child(even){ background:#f0f0f0; }
+        .action-link:hover {
+            opacity: 0.9;
+            transform: scale(1.02);
+        }
 
-        .btn { padding:7px 15px; border:none; border-radius:8px; cursor:pointer; color:#fff; margin:2px; }
-        .btn-upload { background: linear-gradient(135deg, var(--terra-rosa), var(--honey-glow)); }
-        .btn-download { background: var(--skipping-stones); }
-        a.btn-action { padding:5px 10px; border-radius:6px; color:white; text-decoration:none; margin:2px; }
-        a.attendance { background:#3498db; }
-        a.logout { display:block; text-align:center; margin-top:15px; color:var(--midnight-garden); font-weight:bold; text-decoration:none; }
-        .message { text-align:center; color:var(--terra-rosa); margin-bottom:12px; }
+        .action-link.secondary {
+            background: var(--minty-fresh);
+            color: var(--art-craft);
+        }
+
+        .action-link.danger {
+            background: #FF9800;
+        }
+
+        .table-view {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+
+        .table-view th,
+        .table-view td {
+            padding: 12px;
+            border: 1px solid #ddd;
+            text-align: left;
+        }
+
+        .table-view th {
+            background: var(--minty-fresh);
+            color: var(--art-craft);
+            font-weight: bold;
+        }
+
+        .table-view tr:nth-child(even) {
+            background: #f9f9f9;
+        }
+
+        .table-view tr:hover {
+            background: #f0f0f0;
+        }
+
+        .logout-link {
+            text-align: center;
+            margin-top: 40px;
+        }
+
+        .logout-link a {
+            color: var(--terra-rosa);
+            text-decoration: none;
+            font-weight: bold;
+            padding: 12px 25px;
+            border: 2px solid var(--terra-rosa);
+            border-radius: 8px;
+            display: inline-block;
+            transition: all 0.3s;
+        }
+
+        .logout-link a:hover {
+            background: var(--terra-rosa);
+            color: white;
+        }
+
+        .no-modules {
+            text-align: center;
+            padding: 60px 40px;
+            color: #666;
+            background: #f9f9f9;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+
+        .view-toggle {
+            text-align: right;
+            margin: 20px 0;
+        }
+
+        .view-toggle button {
+            padding: 8px 15px;
+            margin-left: 10px;
+            background: var(--minty-fresh);
+            color: var(--art-craft);
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+
+        .view-toggle button.active {
+            background: var(--terra-rosa);
+            color: white;
+        }
+
+        .grid-view {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 20px;
+        }
+
+        .list-view {
+            display: none;
+        }
+
+        .list-view.active {
+            display: block;
+        }
+
+        .grid-view.hidden {
+            display: none;
+        }
+
+        @media (max-width: 768px) {
+            .auth-card {
+                width: 95%;
+                padding: 15px;
+            }
+
+            .modules-container {
+                grid-template-columns: 1fr;
+            }
+
+            .action-buttons {
+                flex-direction: row;
+            }
+
+            .action-link {
+                flex: 1;
+                padding: 8px 10px;
+                font-size: 12px;
+            }
+
+            .table-view {
+                font-size: 12px;
+            }
+
+            .table-view th,
+            .table-view td {
+                padding: 8px;
+            }
+
+            .view-toggle {
+                text-align: center;
+            }
+
+            .view-toggle button {
+                margin: 5px;
+            }
+        }
     </style>
 </head>
 <body>
-<div class="auth-card admin">
-    <h2>Teacher Dashboard</h2>
-    <p>Welcome, <?= $_SESSION['teacher_name'] ?? 'Teacher' ?></p>
 
-    <?php if($message): ?>
-        <div class="message"><?= $message ?></div>
-    <?php endif; ?>
+<div class="auth-card">
+    <h2>👨‍🏫 Teacher Dashboard</h2>
+    <p class="welcome">Welcome, <strong><?= htmlspecialchars($teacher_name) ?></strong></p>
 
-    <?php if(!empty($errors)): ?>
-        <div class="message" style="color:red;">
-            <?php foreach($errors as $e){ echo $e."<br>"; } ?>
+    <h3>📚 Your Modules</h3>
+
+    <?php if (count($modules) > 0): ?>
+        
+        <!-- View Toggle -->
+        <div class="view-toggle">
+            <button class="active" onclick="toggleView('grid')">📊 Grid View</button>
+            <button onclick="toggleView('list')">📋 List View</button>
+        </div>
+
+        <!-- GRID VIEW (Cards) -->
+        <div id="grid-view" class="grid-view">
+            <?php foreach ($modules as $module): ?>
+            <div class="module-card">
+                <div class="module-code"><?= htmlspecialchars($module['module_code']) ?></div>
+                <h4><?= htmlspecialchars($module['module_name']) ?></h4>
+                <div class="module-course">
+                    📚 <?= htmlspecialchars($module['course_name']) ?>
+                </div>
+
+                <div class="action-buttons">
+                    <a href="view_attendance.php?module_id=<?= $module['module_id'] ?>" class="action-link">
+                        📊 View Attendance
+                    </a>
+                    <a href="upload_results.php?module_id=<?= $module['module_id'] ?>" class="action-link secondary">
+                        📝 Upload Results
+                    </a>
+                    <a href="manage_attendance.php?module_id=<?= $module['module_id'] ?>" class="action-link danger">
+                        ✏️ Mark Attendance
+                    </a>
+                </div>
+            </div>
+            <?php endforeach; ?>
+        </div>
+
+        <!-- LIST VIEW (Table) -->
+        <div id="list-view" class="list-view">
+            <table class="table-view">
+                <thead>
+                    <tr>
+                        <th>Module Code</th>
+                        <th>Module Name</th>
+                        <th>Course</th>
+                        <th colspan="3" style="text-align: center;">Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($modules as $module): ?>
+                    <tr>
+                        <td><strong><?= htmlspecialchars($module['module_code']) ?></strong></td>
+                        <td><?= htmlspecialchars($module['module_name']) ?></td>
+                        <td><?= htmlspecialchars($module['course_name']) ?></td>
+                        <td style="text-align: center;">
+                            <a href="view_attendance.php?module_id=<?= $module['module_id'] ?>" class="action-link" style="display: inline-block; padding: 5px 10px; margin: 0; font-size: 12px;">
+                                📊 Attendance
+                            </a>
+                        </td>
+                        <td style="text-align: center;">
+                            <a href="upload_results.php?module_id=<?= $module['module_id'] ?>" class="action-link secondary" style="display: inline-block; padding: 5px 10px; margin: 0; font-size: 12px;">
+                                📝 Results
+                            </a>
+                        </td>
+                        <td style="text-align: center;">
+                            <a href="manage_attendance.php?module_id=<?= $module['module_id'] ?>" class="action-link danger" style="display: inline-block; padding: 5px 10px; margin: 0; font-size: 12px;">
+                                ✏️ Mark
+                            </a>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+
+    <?php else: ?>
+        <div class="no-modules">
+            <p>❌ You have not been assigned any modules yet.</p>
+            <p>Please contact the administrator to assign modules to your account.</p>
         </div>
     <?php endif; ?>
 
-    <!-- Top Dashboard Cards -->
-    <div class="dashboard-container">
-        <a href="#attendance" class="card">Manage Attendance</a>
-        <a href="#results" class="card">Upload Results</a>
-        <a href="change_password.php" class="card" style="background: var(--terra-rosa); color:white;">Change Password</a>
-        <a href="logout.php" class="card" style="background: var(--terra-rosa); color:white;">Logout</a>
+    <div class="logout-link">
+        <a href="logout.php">🚪 Logout</a>
     </div>
-
-    <!-- Attendance Section -->
-    <h3 id="attendance">Manage Attendance</h3>
-    <table>
-        <tr>
-            <th>Module Code</th>
-            <th>Module Name</th>
-            <th>Course</th>
-            <th>Action</th>
-        </tr>
-        <?php mysqli_data_seek($modules, 0); 
-        while($m = mysqli_fetch_assoc($modules)): ?>
-        <tr>
-            <td><?= $m['module_code'] ?></td>
-            <td><?= $m['module_name'] ?></td>
-            <td><?= $m['course_name'] ?></td>
-            <td><a class="btn-action attendance" href="attendance.php?module_id=<?= $m['module_id'] ?>">Manage Attendance</a></td>
-        </tr>
-        <?php endwhile; ?>
-    </table>
-
-    <!-- Upload Results Section -->
-    <h3 id="results">Upload Results</h3>
-    <?php mysqli_data_seek($modules, 0); 
-    while($m = mysqli_fetch_assoc($modules)): ?>
-    <div style="margin-bottom:15px; padding:10px; border:1px solid #566947; border-radius:8px;">
-        <strong><?= $m['module_code'] ?> - <?= $m['module_name'] ?></strong>
-        <form method="POST" enctype="multipart/form-data" style="margin-top:10px;">
-            <input type="hidden" name="module_id" value="<?= $m['module_id'] ?>">
-            <input type="file" name="excel_file" accept=".xlsx,.csv" required>
-            <button class="btn btn-upload" name="upload_excel">Upload Results</button>
-            <button class="btn btn-download" name="download_template">Download Template</button>
-        </form>
-    </div>
-    <?php endwhile; ?>
-
-    <a href="logout.php" class="logout">Logout</a>
 </div>
+
+<script>
+function toggleView(view) {
+    const gridView = document.getElementById('grid-view');
+    const listView = document.getElementById('list-view');
+    const buttons = document.querySelectorAll('.view-toggle button');
+
+    if (view === 'grid') {
+        gridView.classList.remove('hidden');
+        listView.classList.remove('active');
+        buttons[0].classList.add('active');
+        buttons[1].classList.remove('active');
+    } else {
+        gridView.classList.add('hidden');
+        listView.classList.add('active');
+        buttons[0].classList.remove('active');
+        buttons[1].classList.add('active');
+    }
+}
+</script>
+
 </body>
 </html>

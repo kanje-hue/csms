@@ -39,7 +39,7 @@ $course_stmt->close();
 
 $course_name = $course ? $course['course_name'] : 'Unknown Course';
 
-// Fetch modules for ALL years (1, 2, 3) to allow viewing previous semesters
+// Fetch modules for the student's course and year
 $modules_query = "
     SELECT DISTINCT 
         m.module_id,
@@ -47,29 +47,24 @@ $modules_query = "
         m.module_name,
         m.year,
         m.semester,
-        t.fullname AS teacher_name,
-        COUNT(r.result_id) as has_results,
-        MAX(r.published) as results_published
+        t.fullname AS teacher_name
     FROM modules m
     LEFT JOIN teachers t ON m.teacher_id = t.teacher_id
-    LEFT JOIN results r ON r.module_id = m.module_id AND r.student_id = ?
     WHERE m.deleted = 0 
     AND m.course_id = ?
-    AND m.year <= ?
-    GROUP BY m.module_id, m.year, m.semester
-    ORDER BY m.year DESC, m.semester DESC, m.module_name ASC
+    AND m.year = ?
+    ORDER BY m.semester DESC, m.module_name ASC
 ";
 
 $modules_stmt = $conn->prepare($modules_query);
-$modules_stmt->bind_param("iii", $student_id, $course_id, $current_year);
+$modules_stmt->bind_param("ii", $course_id, $current_year);
 $modules_stmt->execute();
 $modules_result = $modules_stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $modules_stmt->close();
 
-// Fetch results for all years
+// Fetch results for the student - FIXED: specify r.module_id
 $results_query = "
     SELECT 
-        r.result_id,
         r.module_id,
         r.ca_marks,
         r.final_marks,
@@ -321,35 +316,28 @@ $avg_marks = $results_count > 0 ? round($total_marks / $results_count) : 0;
     </div>
 
     <!-- Modules by Year -->
-    <h3>📘 Registered Modules (All Years)</h3>
+    <h3>📘 Registered Modules (Year <?= $current_year ?>)</h3>
     <?php if (count($modules_result) > 0): ?>
         <table>
             <tr>
                 <th>Code</th>
                 <th>Module Name</th>
-                <th>Year</th>
                 <th>Semester</th>
                 <th>Teacher</th>
-                <th>Status</th>
             </tr>
             <?php 
-            $last_year = null;
             foreach ($modules_result as $m): 
-                $badge_class = ($m['year'] == $current_year) ? 'badge-current' : 'badge-previous';
-                $badge_text = ($m['year'] == $current_year) ? 'Current' : 'Previous';
             ?>
             <tr>
                 <td><strong><?= htmlspecialchars($m['module_code']) ?></strong></td>
                 <td><?= htmlspecialchars($m['module_name']) ?></td>
-                <td><?= $m['year'] ?></td>
                 <td><?= $m['semester'] ?></td>
                 <td><?= htmlspecialchars($m['teacher_name'] ?? 'Unassigned') ?></td>
-                <td><span class="badge <?= $badge_class ?>"><?= $badge_text ?></span></td>
             </tr>
             <?php endforeach; ?>
         </table>
     <?php else: ?>
-        <div class="no-data">No modules registered for this course</div>
+        <div class="no-data">📭 No modules registered for this course and year</div>
     <?php endif; ?>
 
     <!-- Results -->
@@ -359,7 +347,6 @@ $avg_marks = $results_count > 0 ? round($total_marks / $results_count) : 0;
             <tr>
                 <th>Code</th>
                 <th>Module Name</th>
-                <th>Year</th>
                 <th>Semester</th>
                 <th>CA (0-60)</th>
                 <th>Final (0-40)</th>
@@ -375,7 +362,6 @@ $avg_marks = $results_count > 0 ? round($total_marks / $results_count) : 0;
             <tr>
                 <td><strong><?= htmlspecialchars($r['module_code']) ?></strong></td>
                 <td><?= htmlspecialchars($r['module_name']) ?></td>
-                <td><?= $r['year'] ?></td>
                 <td><?= $r['semester'] ?></td>
                 <td><?= $r['ca_marks'] ?? '-' ?></td>
                 <td><?= $r['final_marks'] ?? '-' ?></td>
@@ -388,7 +374,7 @@ $avg_marks = $results_count > 0 ? round($total_marks / $results_count) : 0;
             <?php endforeach; ?>
         </table>
     <?php else: ?>
-        <div class="no-data">No published results yet</div>
+        <div class="no-data">📭 No published results yet</div>
     <?php endif; ?>
 
     <div class="auth-links">
