@@ -33,9 +33,8 @@ if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['a
         $message_type = "error";
     } else {
         $course_name = safe_string($_POST['course_name'] ?? '');
-        $duration = safe_int($_POST['duration'] ?? 0);
 
-        if(empty($course_name) || !$duration){
+        if(empty($course_name)){
             $message = "Please fill all required fields";
             $message_type = "error";
         } else {
@@ -52,7 +51,7 @@ if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['a
                 $stmt->bind_param("s", $course_name);
                 
                 if($stmt->execute()){
-                    $message = "Course created successfully";
+                    $message = "✓ Course created successfully";
                     $message_type = "success";
                 } else {
                     $message = "Error creating course: " . $stmt->error;
@@ -89,7 +88,7 @@ if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['a
             $stmt->bind_param("ssi", $course_name, $status, $course_id);
             
             if($stmt->execute()){
-                $message = "Course updated successfully";
+                $message = "✓ Course updated successfully";
                 $message_type = "success";
             } else {
                 $message = "Error updating course: " . $stmt->error;
@@ -118,39 +117,10 @@ if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['a
             $stmt->bind_param("i", $course_id);
             
             if($stmt->execute()){
-                $message = "Course deleted successfully";
+                $message = "✓ Course deleted successfully";
                 $message_type = "success";
             } else {
                 $message = "Error deleting course";
-                $message_type = "error";
-            }
-            $stmt->close();
-        }
-    }
-}
-
-/* ================= RESTORE COURSE ================= */
-if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'restore'){
-    
-    // Verify CSRF
-    if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
-        $message = "Security token verification failed";
-        $message_type = "error";
-    } else {
-        $course_id = safe_int($_POST['course_id'] ?? 0);
-        
-        if(!$course_id){
-            $message = "Invalid course ID";
-            $message_type = "error";
-        } else {
-            $stmt = $conn->prepare("UPDATE courses SET deleted = 0 WHERE course_id = ?");
-            $stmt->bind_param("i", $course_id);
-            
-            if($stmt->execute()){
-                $message = "Course restored successfully";
-                $message_type = "success";
-            } else {
-                $message = "Error restoring course";
                 $message_type = "error";
             }
             $stmt->close();
@@ -238,16 +208,16 @@ $semester = isset($_GET['semester']) ? safe_int($_GET['semester']) : null;
 
         /* STEP 1: Course Selection */
         .courses-container {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-            gap: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
             margin: 30px 0;
         }
 
         .course-card {
             background: linear-gradient(135deg, var(--skipping-stones), var(--minty-fresh));
-            padding: 20px;
-            border-radius: 18px;
+            padding: 25px;
+            border-radius: 12px;
             text-align: center;
             font-weight: bold;
             font-size: 18px;
@@ -259,7 +229,7 @@ $semester = isset($_GET['semester']) ? safe_int($_GET['semester']) : null;
             flex-direction: column;
             justify-content: center;
             align-items: center;
-            min-height: 120px;
+            min-height: 90px;
             box-shadow: 0 4px 6px rgba(0,0,0,0.1);
         }
 
@@ -268,21 +238,30 @@ $semester = isset($_GET['semester']) ? safe_int($_GET['semester']) : null;
             box-shadow: 0 8px 12px rgba(0,0,0,0.15);
         }
 
+        .course-card-main {
+            margin-bottom: 8px;
+        }
+
+        .course-status {
+            font-size: 12px;
+            margin-bottom: 12px;
+            font-weight: normal;
+        }
+
         .course-card-actions {
             display: flex;
-            gap: 5px;
+            gap: 10px;
             margin-top: 10px;
-            font-size: 12px;
             width: 100%;
+            justify-content: center;
         }
 
         .btn-small {
-            flex: 1;
-            padding: 4px 8px;
+            padding: 6px 20px;
             border: none;
             border-radius: 4px;
             cursor: pointer;
-            font-size: 11px;
+            font-size: 12px;
             font-weight: bold;
             text-decoration: none;
             text-align: center;
@@ -607,21 +586,21 @@ $semester = isset($_GET['semester']) ? safe_int($_GET['semester']) : null;
 
         <div class="courses-container">
             <?php foreach($courses as $course): ?>
-                <a class="course-card" href="?course_id=<?= $course['course_id'] ?>">
-                    <div><?= htmlspecialchars($course['course_name']) ?></div>
-                    <span style="font-size: 12px; margin-top: 5px; font-weight: normal;">
+                <div class="course-card" onclick="window.location.href='?course_id=<?= $course['course_id'] ?>'">
+                    <div class="course-card-main"><?= htmlspecialchars($course['course_name']) ?></div>
+                    <div class="course-status">
                         <?= $course['status'] === 'active' ? '✓ Active' : '⚠️ Inactive' ?>
-                    </span>
+                    </div>
                     <div class="course-card-actions">
-                        <button class="btn-small btn-edit-course" onclick="openEditCourseModal(<?= htmlspecialchars(json_encode($course)) ?>); event.preventDefault();">Edit</button>
-                        <form method="POST" style="flex: 1;">
+                        <button class="btn-small btn-edit-course" onclick="event.stopPropagation(); openEditCourseModal(<?= htmlspecialchars(json_encode($course)) ?>);">Edit</button>
+                        <form method="POST" style="display: inline;" onclick="event.stopPropagation();">
                             <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
                             <input type="hidden" name="action" value="delete">
                             <input type="hidden" name="course_id" value="<?= $course['course_id'] ?>">
                             <button type="submit" class="btn-small btn-delete-course" onclick="return confirm('Delete this course?')">Delete</button>
                         </form>
                     </div>
-                </a>
+                </div>
             <?php endforeach; ?>
         </div>
 
@@ -696,7 +675,7 @@ $semester = isset($_GET['semester']) ? safe_int($_GET['semester']) : null;
 
         <!-- Back Link -->
         <div class="back-link">
-            <a href="dashboard.php">← Back to Dashboard</a>
+            <a href="manage_courses.php">← Reset</a>
         </div>
     </div>
 </div>
