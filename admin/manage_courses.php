@@ -7,7 +7,6 @@ if(!isset($_SESSION['admin_logged_in'])){
     exit();
 }
 
-// Inline validation functions
 function safe_int($value) {
     return filter_var($value, FILTER_VALIDATE_INT);
 }
@@ -16,7 +15,6 @@ function safe_string($value) {
     return htmlspecialchars(trim($value), ENT_QUOTES, 'UTF-8');
 }
 
-// Generate CSRF token
 if (empty($_SESSION['csrf_token'])) {
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 }
@@ -28,7 +26,6 @@ $admin_name = $_SESSION['admin_name'] ?? 'Admin';
 /* ================= ADD COURSE ================= */
 if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'add'){
     
-    // Verify CSRF
     if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
         $message = "Security token verification failed";
         $message_type = "error";
@@ -40,7 +37,6 @@ if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['a
             $message = "Please fill all required fields";
             $message_type = "error";
         } else {
-            // Check if course already exists
             $check = $conn->prepare("SELECT course_id FROM courses WHERE course_name = ? AND deleted = 0");
             $check->bind_param("s", $course_name);
             $check->execute();
@@ -69,7 +65,6 @@ if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['a
 /* ================= UPDATE COURSE ================= */
 if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'update'){
     
-    // Verify CSRF
     if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
         $message = "Security token verification failed";
         $message_type = "error";
@@ -104,7 +99,6 @@ if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['a
 /* ================= DELETE COURSE ================= */
 if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'delete'){
     
-    // Verify CSRF
     if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
         $message = "Security token verification failed";
         $message_type = "error";
@@ -130,28 +124,58 @@ if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['a
     }
 }
 
-/* ================= RESTORE COURSE ================= */
-if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'restore'){
+/* ================= PUBLISH/UNPUBLISH RESULTS ================= */
+if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && in_array($_POST['action'], ['publish', 'unpublish'])){
     
-    // Verify CSRF
+    if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
+        $message = "Security token verification failed";
+        $message_type = "error";
+    } else {
+        $result_id = safe_int($_POST['result_id'] ?? 0);
+        $status = $_POST['action'] === 'publish' ? 'published' : 'draft';
+        
+        if($result_id){
+            $stmt = $conn->prepare("UPDATE results SET status = ? WHERE id = ?");
+            $stmt->bind_param("si", $status, $result_id);
+            
+            if($stmt->execute()){
+                $message = "✓ Result " . $_POST['action'] . "ed successfully";
+                $message_type = "success";
+            } else {
+                $message = "Error updating result";
+                $message_type = "error";
+            }
+            $stmt->close();
+        }
+    }
+}
+
+/* ================= BULK PUBLISH/UNPUBLISH ================= */
+if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && in_array($_POST['action'], ['bulk_publish', 'bulk_unpublish'])){
+    
     if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
         $message = "Security token verification failed";
         $message_type = "error";
     } else {
         $course_id = safe_int($_POST['course_id'] ?? 0);
+        $semester = safe_int($_POST['semester'] ?? 0);
+        $status = $_POST['action'] === 'bulk_publish' ? 'published' : 'draft';
         
-        if(!$course_id){
-            $message = "Invalid course ID";
-            $message_type = "error";
-        } else {
-            $stmt = $conn->prepare("UPDATE courses SET deleted = 0 WHERE course_id = ?");
-            $stmt->bind_param("i", $course_id);
+        if($course_id && $semester){
+            // Update all results for modules in this course/semester
+            $stmt = $conn->prepare("
+                UPDATE results r
+                INNER JOIN modules m ON r.module_id = m.module_id
+                SET r.status = ?
+                WHERE m.course_id = ? AND m.semester = ? AND m.deleted = 0
+            ");
+            $stmt->bind_param("sii", $status, $course_id, $semester);
             
             if($stmt->execute()){
-                $message = "Course restored successfully";
+                $message = "✓ All results have been " . $_POST['action'] . "ed successfully";
                 $message_type = "success";
             } else {
-                $message = "Error restoring course";
+                $message = "Error updating results";
                 $message_type = "error";
             }
             $stmt->close();
@@ -165,7 +189,6 @@ $stmt->execute();
 $courses = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $stmt->close();
 
-// Get selected course if navigating
 $selected_course = null;
 $course_id = isset($_GET['course_id']) ? safe_int($_GET['course_id']) : null;
 if($course_id){
@@ -188,14 +211,14 @@ $semester = isset($_GET['semester']) ? safe_int($_GET['semester']) : null;
     <link rel="stylesheet" href="../assets/css/auth.css">
     <style>
         .container {
-            max-width: 1000px;
+            max-width: 1200px;
             margin: 0 auto;
             padding: 20px;
         }
 
         .auth-card { 
             width: 100%;
-            max-width: 900px;
+            max-width: 1200px;
             margin: 0 auto;
         }
 
@@ -269,6 +292,7 @@ $semester = isset($_GET['semester']) ? safe_int($_GET['semester']) : null;
             text-align: center;
             color: #333;
             margin-bottom: 30px;
+            margin-top: 40px;
         }
 
         h3 {
@@ -278,7 +302,7 @@ $semester = isset($_GET['semester']) ? safe_int($_GET['semester']) : null;
             margin-bottom: 15px;
         }
 
-        /* STEP 1: Course Selection */
+        /* Course Selection */
         .courses-container {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
@@ -349,7 +373,266 @@ $semester = isset($_GET['semester']) ? safe_int($_GET['semester']) : null;
             background: #da190b;
         }
 
-        /* STEP 2: Year/Semester Selection */
+        /* RESULTS SECTION */
+        .results-card {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            padding: 25px;
+            border-radius: 12px;
+            cursor: pointer;
+            text-align: center;
+            font-weight: bold;
+            font-size: 20px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            transition: all 0.3s;
+            margin-top: 30px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 15px;
+            min-height: 80px;
+        }
+
+        .results-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 8px 12px rgba(0,0,0,0.15);
+        }
+
+        .results-card-icon {
+            font-size: 40px;
+        }
+
+        .results-card-text {
+            text-align: left;
+        }
+
+        .results-card-title {
+            font-size: 22px;
+            margin: 0;
+        }
+
+        .results-card-subtitle {
+            font-size: 13px;
+            opacity: 0.9;
+            margin: 5px 0 0 0;
+        }
+
+        /* Results Content (Hidden by default) */
+        .results-content {
+            display: none;
+            margin-top: 30px;
+        }
+
+        .results-content.active {
+            display: block;
+        }
+
+        .semester-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 25px;
+            margin-bottom: 30px;
+        }
+
+        .semester-card {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            overflow: hidden;
+            border-top: 4px solid var(--terra-rosa);
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .semester-card:hover {
+            box-shadow: 0 8px 15px rgba(0,0,0,0.15);
+            transform: translateY(-3px);
+        }
+
+        .semester-card-header {
+            background: linear-gradient(135deg, var(--terra-rosa), var(--honey-glow));
+            color: white;
+            padding: 15px;
+            font-weight: bold;
+            font-size: 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .semester-card-icon {
+            font-size: 20px;
+        }
+
+        .semester-card-content {
+            display: none;
+            padding: 15px;
+        }
+
+        .semester-card-content.active {
+            display: block;
+        }
+
+        .semester-stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 8px;
+            margin-bottom: 15px;
+        }
+
+        .stat-item {
+            background: #f5f5f5;
+            padding: 10px;
+            border-radius: 6px;
+            text-align: center;
+            border: 1px solid #eee;
+        }
+
+        .stat-label {
+            font-size: 11px;
+            color: #666;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+
+        .stat-value {
+            font-size: 18px;
+            font-weight: bold;
+            color: var(--terra-rosa);
+        }
+
+        .results-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+
+        .results-table th {
+            background: #f5f5f5;
+            padding: 8px;
+            text-align: left;
+            font-weight: bold;
+            font-size: 12px;
+            border-bottom: 2px solid #ddd;
+            color: #333;
+        }
+
+        .results-table td {
+            padding: 8px;
+            border-bottom: 1px solid #eee;
+            font-size: 12px;
+        }
+
+        .results-table tr:hover {
+            background: #f9f9f9;
+        }
+
+        .module-code {
+            font-weight: bold;
+            color: var(--midnight-garden);
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 10px;
+            font-size: 10px;
+            font-weight: bold;
+        }
+
+        .status-published {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .status-draft {
+            background: #fff3cd;
+            color: #856404;
+        }
+
+        .result-actions {
+            display: flex;
+            gap: 5px;
+        }
+
+        .result-btn {
+            padding: 4px 8px;
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 10px;
+            font-weight: bold;
+            text-decoration: none;
+            display: inline-block;
+            transition: all 0.2s;
+        }
+
+        .result-btn-view {
+            background: #2196F3;
+            color: white;
+        }
+
+        .result-btn-view:hover {
+            background: #0b7dda;
+        }
+
+        .result-btn-publish {
+            background: #4CAF50;
+            color: white;
+        }
+
+        .result-btn-publish:hover {
+            background: #45a049;
+        }
+
+        .result-btn-unpublish {
+            background: #FF9800;
+            color: white;
+        }
+
+        .result-btn-unpublish:hover {
+            background: #E68900;
+        }
+
+        .no-results {
+            text-align: center;
+            padding: 15px;
+            color: #999;
+            font-size: 12px;
+        }
+
+        .bulk-action-btn {
+            display: block;
+            width: 100%;
+            padding: 10px;
+            margin-top: 10px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 12px;
+            transition: all 0.3s;
+        }
+
+        .bulk-publish-btn {
+            background: #4CAF50;
+            color: white;
+        }
+
+        .bulk-publish-btn:hover {
+            background: #45a049;
+        }
+
+        .bulk-unpublish-btn {
+            background: #FF9800;
+            color: white;
+        }
+
+        .bulk-unpublish-btn:hover {
+            background: #E68900;
+        }
+
+        /* Year/Semester Selection */
         .selection-form {
             background: #f9f9f9;
             padding: 20px;
@@ -399,7 +682,7 @@ $semester = isset($_GET['semester']) ? safe_int($_GET['semester']) : null;
             background: #0b7dda;
         }
 
-        /* STEP 3: Management Options */
+        /* Management Options */
         .manage-buttons {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -480,7 +763,7 @@ $semester = isset($_GET['semester']) ? safe_int($_GET['semester']) : null;
             text-decoration: underline;
         }
 
-        /* Add/Edit Course Modal */
+        /* Modal */
         .modal {
             display: none;
             position: fixed;
@@ -626,8 +909,43 @@ $semester = isset($_GET['semester']) ? safe_int($_GET['semester']) : null;
                 font-size: 22px;
             }
 
-            .welcome-section p {
-                font-size: 14px;
+            .semester-cards {
+                grid-template-columns: 1fr;
+            }
+
+            .semester-stats {
+                grid-template-columns: repeat(3, 1fr);
+            }
+
+            .results-table {
+                font-size: 10px;
+            }
+
+            .results-table th,
+            .results-table td {
+                padding: 6px;
+            }
+
+            .result-actions {
+                flex-direction: column;
+            }
+
+            .result-btn {
+                width: 100%;
+                padding: 6px 4px;
+            }
+
+            .results-card {
+                flex-direction: column;
+                gap: 10px;
+            }
+
+            .results-card-icon {
+                font-size: 35px;
+            }
+
+            .results-card-title {
+                font-size: 18px;
             }
         }
     </style>
@@ -682,9 +1000,170 @@ $semester = isset($_GET['semester']) ? safe_int($_GET['semester']) : null;
             <?php endforeach; ?>
         </div>
 
-        <?php if($selected_course): ?>
-            <hr>
+        <!-- RESULTS CARD (COLLAPSIBLE) -->
+        <div class="results-card" onclick="toggleResultsSection()">
+            <div class="results-card-icon">📊</div>
+            <div class="results-card-text">
+                <div class="results-card-title">Results</div>
+                <div class="results-card-subtitle">Manage and publish student results</div>
+            </div>
+        </div>
 
+        <!-- RESULTS CONTENT (HIDDEN BY DEFAULT) -->
+        <div class="results-content" id="resultsContent">
+            <div class="semester-cards">
+                <?php for($sem = 1; $sem <= 2; $sem++): 
+                    // Get all modules with results for this semester
+                    $modules_results_query = "
+                        SELECT 
+                            m.module_id,
+                            m.module_code,
+                            m.module_name,
+                            m.year,
+                            r.id as result_id,
+                            r.status,
+                            COUNT(DISTINCT r.student_id) as student_count
+                        FROM modules m
+                        LEFT JOIN results r ON m.module_id = r.module_id
+                        WHERE m.course_id = ? AND m.semester = ? AND m.deleted = 0
+                        GROUP BY m.module_id, m.module_code, m.module_name, m.year, r.id, r.status
+                        ORDER BY m.year, m.module_code
+                    ";
+                    
+                    $modules_results_stmt = $conn->prepare($modules_results_query);
+                    $modules_results_stmt->bind_param("ii", $course_id, $sem);
+                    $modules_results_stmt->execute();
+                    $modules_with_results = $modules_results_stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+                    $modules_results_stmt->close();
+                    
+                    // Calculate statistics
+                    $stats_query = "
+                        SELECT 
+                            COUNT(DISTINCT m.module_id) as total,
+                            COUNT(DISTINCT CASE WHEN r.id IS NOT NULL THEN m.module_id END) as with_results
+                        FROM modules m
+                        LEFT JOIN results r ON m.module_id = r.module_id
+                        WHERE m.course_id = ? AND m.semester = ? AND m.deleted = 0
+                    ";
+                    
+                    $stats_stmt = $conn->prepare($stats_query);
+                    $stats_stmt->bind_param("ii", $course_id, $sem);
+                    $stats_stmt->execute();
+                    $stats = $stats_stmt->get_result()->fetch_assoc();
+                    $stats_stmt->close();
+                    
+                    $total_modules_sem = $stats['total'] ?? 0;
+                    $modules_with_submitted_results = $stats['with_results'] ?? 0;
+                    $modules_pending = $total_modules_sem - $modules_with_submitted_results;
+                ?>
+                <div class="semester-card">
+                    <div class="semester-card-header" onclick="toggleSemesterContent(event)">
+                        <div>
+                            <div class="semester-card-icon">📚</div>
+                            <span>Semester <?= $sem ?></span>
+                        </div>
+                        <span style="font-size: 18px;">▼</span>
+                    </div>
+
+                    <div class="semester-card-content" id="semester<?= $sem ?>Content">
+                        <div class="semester-stats">
+                            <div class="stat-item">
+                                <div class="stat-label">Total Modules</div>
+                                <div class="stat-value"><?= $total_modules_sem ?></div>
+                            </div>
+                            <div class="stat-item">
+                                <div class="stat-label">Results Sent</div>
+                                <div class="stat-value" style="color: #4CAF50;"><?= $modules_with_submitted_results ?></div>
+                            </div>
+                            <div class="stat-item">
+                                <div class="stat-label">Pending</div>
+                                <div class="stat-value" style="color: #FF9800;"><?= $modules_pending ?></div>
+                            </div>
+                        </div>
+
+                        <?php if(count($modules_with_results) > 0): ?>
+                            <table class="results-table">
+                                <thead>
+                                    <tr>
+                                        <th>Year</th>
+                                        <th>Module Code</th>
+                                        <th>Module Name</th>
+                                        <th>Students</th>
+                                        <th>Status</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <?php foreach($modules_with_results as $result): ?>
+                                        <?php if($result['result_id']): ?>
+                                        <tr>
+                                            <td><?= $result['year'] ?></td>
+                                            <td class="module-code"><?= htmlspecialchars($result['module_code']) ?></td>
+                                            <td><?= htmlspecialchars(substr($result['module_name'], 0, 20)) ?></td>
+                                            <td><?= $result['student_count'] ?></td>
+                                            <td>
+                                                <span class="status-badge <?= $result['status'] === 'published' ? 'status-published' : 'status-draft' ?>">
+                                                    <?= ucfirst($result['status']) ?>
+                                                </span>
+                                            </td>
+                                            <td>
+                                                <div class="result-actions">
+                                                    <a href="view_results.php?module_id=<?= $result['module_id'] ?>" class="result-btn result-btn-view" title="View">👁️</a>
+                                                    
+                                                    <?php if($result['status'] === 'draft'): ?>
+                                                    <form method="POST" style="display: inline;">
+                                                        <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+                                                        <input type="hidden" name="action" value="publish">
+                                                        <input type="hidden" name="result_id" value="<?= $result['result_id'] ?>">
+                                                        <button type="submit" class="result-btn result-btn-publish" title="Publish" onclick="return confirm('Publish?')">📤</button>
+                                                    </form>
+                                                    <?php else: ?>
+                                                    <form method="POST" style="display: inline;">
+                                                        <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+                                                        <input type="hidden" name="action" value="unpublish">
+                                                        <input type="hidden" name="result_id" value="<?= $result['result_id'] ?>">
+                                                        <button type="submit" class="result-btn result-btn-unpublish" title="Unpublish" onclick="return confirm('Unpublish?')">📥</button>
+                                                    </form>
+                                                    <?php endif; ?>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                        <?php endif; ?>
+                                    <?php endforeach; ?>
+                                </tbody>
+                            </table>
+
+                            <!-- BULK ACTION BUTTONS -->
+                            <div style="display: flex; gap: 10px; margin-top: 15px;">
+                                <form method="POST" style="flex: 1;">
+                                    <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+                                    <input type="hidden" name="action" value="bulk_publish">
+                                    <input type="hidden" name="course_id" value="<?= $course_id ?>">
+                                    <input type="hidden" name="semester" value="<?= $sem ?>">
+                                    <button type="submit" class="bulk-action-btn bulk-publish-btn" onclick="return confirm('Publish all results for Semester <?= $sem ?>?')">📤 Publish All</button>
+                                </form>
+                                <form method="POST" style="flex: 1;">
+                                    <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+                                    <input type="hidden" name="action" value="bulk_unpublish">
+                                    <input type="hidden" name="course_id" value="<?= $course_id ?>">
+                                    <input type="hidden" name="semester" value="<?= $sem ?>">
+                                    <button type="submit" class="bulk-action-btn bulk-unpublish-btn" onclick="return confirm('Unpublish all results for Semester <?= $sem ?>?')">📥 Unpublish All</button>
+                                </form>
+                            </div>
+                        <?php else: ?>
+                            <div class="no-results">
+                                ⏳ No results submitted yet for Semester <?= $sem ?>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+                </div>
+                <?php endfor; ?>
+            </div>
+        </div>
+
+        <hr>
+
+        <?php if($selected_course): ?>
             <!-- Breadcrumb -->
             <div class="breadcrumb">
                 📍 You selected: <strong><?= htmlspecialchars($selected_course['course_name']) ?></strong>
@@ -793,7 +1272,22 @@ $semester = isset($_GET['semester']) ? safe_int($_GET['semester']) : null;
 </div>
 
 <script>
-// Modal functions
+function toggleResultsSection() {
+    const resultsContent = document.getElementById('resultsContent');
+    resultsContent.classList.toggle('active');
+}
+
+function toggleSemesterContent(event) {
+    event.stopPropagation();
+    const header = event.currentTarget;
+    const semesterCard = header.closest('.semester-card');
+    const content = semesterCard.querySelector('.semester-card-content');
+    const icon = header.querySelector('span:last-child');
+    
+    content.classList.toggle('active');
+    icon.style.transform = content.classList.contains('active') ? 'rotate(0deg)' : 'rotate(-180deg)';
+}
+
 function openAddCourseModal() {
     document.getElementById('modalTitle').textContent = 'Add New Course';
     document.getElementById('formAction').value = 'add';
@@ -817,7 +1311,6 @@ function closeCourseModal() {
     document.getElementById('courseModal').classList.remove('show');
 }
 
-// Close modal when clicking outside
 window.onclick = function(event) {
     const modal = document.getElementById('courseModal');
     if (event.target === modal) {
