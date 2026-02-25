@@ -1,34 +1,58 @@
 <?php
 session_start();
 include '../config/db.php';
+require_once '../config/security.php';
 
-$message = '';
+$security = new SecurityManager($conn);
+$message  = '';
 
 if($_SERVER['REQUEST_METHOD'] === 'POST'){
-    $email = trim($_POST['email'] ?? '');
-    $password = trim($_POST['password'] ?? '');
+    $email    = trim($_POST['email'] ?? '');
+    $password = $_POST['password'] ?? '';
     
     if(empty($email) || empty($password)){
         $message = "❌ Please fill in all fields";
     } else {
-        $stmt = $conn->prepare("SELECT admin_id, name, email FROM admins WHERE email = ? AND password = ? AND deleted = 0");
-        $stmt->bind_param("ss", $email, $password);
+        $stmt = $conn->prepare(
+            "SELECT admin_id, name, email, password, force_password_change, locked_until, failed_login_attempts
+             FROM admins WHERE email = ? AND deleted = 0"
+        );
+        $stmt->bind_param("s", $email);
         $stmt->execute();
-        $result = $stmt->get_result();
-        
-        if($result->num_rows > 0){
-            $admin = $result->fetch_assoc();
+        $admin = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+
+        if (!$admin) {
+            $security->logLoginAttempt('admins', null, $email, 'failed');
+            $message = "❌ Invalid email or password";
+        } elseif ($security->isAccountLocked('admins', $admin['admin_id'])) {
+            $security->logLoginAttempt('admins', $admin['admin_id'], $email, 'locked');
+            $message = "🔒 Account locked due to too many failed attempts. Please try again later.";
+        } elseif (!$security->verifyPassword($password, $admin['password'])) {
+            $security->recordFailedLogin('admins', $admin['admin_id']);
+            $security->logLoginAttempt('admins', $admin['admin_id'], $email, 'failed');
+            $remaining = max(0, SecurityManager::MAX_LOGIN_ATTEMPTS - ($admin['failed_login_attempts'] + 1));
+            $message   = "❌ Invalid email or password. $remaining attempt(s) remaining.";
+        } else {
+            $security->resetLoginAttempts('admins', $admin['admin_id']);
+            $security->logLoginAttempt('admins', $admin['admin_id'], $email, 'success');
+
             $_SESSION['admin_logged_in'] = true;
-            $_SESSION['admin_id'] = $admin['admin_id'];
-            $_SESSION['admin_name'] = $admin['name'];
-            $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-            
+            $_SESSION['admin_id']        = $admin['admin_id'];
+            $_SESSION['admin_name']      = $admin['name'];
+            $_SESSION['user_role']       = 'admin';
+            $_SESSION['csrf_token']      = bin2hex(random_bytes(32));
+
+            if ($admin['force_password_change']) {
+                $_SESSION['force_change_role'] = 'admin';
+                $_SESSION['force_change_id']   = $admin['admin_id'];
+                header("Location: ../public/change_password.php");
+                exit();
+            }
+
             header("Location: manage_courses.php");
             exit();
-        } else {
-            $message = "❌ Invalid email or password";
         }
-        $stmt->close();
     }
 }
 

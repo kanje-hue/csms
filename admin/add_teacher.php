@@ -1,28 +1,42 @@
 <?php
 session_start();
 include '../config/db.php';
+require_once '../config/security.php';
 
 if(!isset($_SESSION['admin_logged_in'])){
     header("Location: login.php");
     exit();
 }
 
-$message = "";
+$security = new SecurityManager($conn);
+$message  = "";
 
 if(isset($_POST['add_teacher'])){
-    $fullname = mysqli_real_escape_string($conn, $_POST['fullname']);
-    $email    = mysqli_real_escape_string($conn, $_POST['email']);
-    $password = password_hash($_POST['password'], PASSWORD_DEFAULT);
+    $fullname = trim($_POST['fullname'] ?? '');
+    $email    = trim($_POST['email'] ?? '');
+    $password = $security->generateSecurePassword();
 
-    $check = mysqli_query($conn, "SELECT teacher_id FROM teachers WHERE email='$email'");
-    if(mysqli_num_rows($check) > 0){
+    $check = $conn->prepare("SELECT teacher_id FROM teachers WHERE email = ?");
+    $check->bind_param("s", $email);
+    $check->execute();
+    $exists = $check->get_result()->num_rows > 0;
+    $check->close();
+
+    if ($exists) {
         $message = "Teacher already exists!";
     } else {
-        mysqli_query($conn, "
-            INSERT INTO teachers (fullname,email,password,status)
-            VALUES ('$fullname','$email','$password','active')
-        ");
-        $message = "Teacher added successfully!";
+        $hash = $security->hashPassword($password);
+        $stmt = $conn->prepare(
+            "INSERT INTO teachers (fullname, email, password, status, force_password_change)
+             VALUES (?, ?, ?, 'active', 1)"
+        );
+        $stmt->bind_param("sss", $fullname, $email, $hash);
+        if ($stmt->execute()) {
+            $message = "Teacher added successfully! Temporary password: <strong>" . htmlspecialchars($password) . "</strong> (shown once – please note it)";
+        } else {
+            $message = "Error adding teacher: " . $stmt->error;
+        }
+        $stmt->close();
     }
 }
 ?>
@@ -51,11 +65,6 @@ if(isset($_POST['add_teacher'])){
         <div class="form-group">
             <label>Email</label>
             <input type="email" name="email" required>
-        </div>
-
-        <div class="form-group">
-            <label>Password</label>
-            <input type="password" name="password" required>
         </div>
 
         <button class="btn" name="add_teacher">Add Teacher</button>
