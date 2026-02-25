@@ -3,6 +3,36 @@ session_start();
 include '../config/db.php';
 
 if(!isset($_SESSION['student_id'])){
+    header("Location: ../index.php");
+    exit();
+}
+
+function safe_int($value) {
+    return filter_var($value, FILTER_VALIDATE_INT);
+}
+
+$student_id = $_SESSION['student_id'];
+$student_name = $_SESSION['student_name'] ?? 'Student';
+$course_id = $_SESSION['course_id'] ?? null;
+
+// Get student info
+$student_stmt = $conn->prepare("SELECT student_id, reg_number, name, course_id, year FROM students WHERE student_id = ? AND deleted = 0");
+$student_stmt->bind_param("i", $student_id);
+$student_stmt->execute();
+$student = $student_stmt->get_result()->fetch_assoc();
+$student_stmt->close();
+
+if (!$student) {
+    header("Location: ../index.php");
+    exit();
+}
+
+// ... rest of the code continues
+<?php
+session_start();
+include '../config/db.php';
+
+if(!isset($_SESSION['student_id'])){
     header("Location: login.php");
     exit();
 }
