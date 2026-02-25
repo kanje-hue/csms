@@ -1,289 +1,231 @@
-<?php 
+<?php
 session_start();
-include "../config/db.php";
-$message = "";
+include '../config/db.php';
 
-if (isset($_POST['login'])) {
-    $email = mysqli_real_escape_string($conn, $_POST['email']);
-    $pass  = $_POST['password'];
+$message = '';
 
-    $sql = mysqli_query($conn, "SELECT * FROM students WHERE email='$email' AND status='active'");
-
-    if (mysqli_num_rows($sql) === 1) {
-        $row = mysqli_fetch_assoc($sql);
-
-        if (password_verify($pass, $row['password'])) {
-            $_SESSION['student_id']   = $row['student_id'];
-            $_SESSION['student_name'] = $row['name'];
-            $_SESSION['course_id']    = $row['course_id'];
-            $_SESSION['semester']     = $row['semester'];
-            $_SESSION['role']         = $row['role']; // Assuming role is in the students table
+if($_SERVER['REQUEST_METHOD'] === 'POST'){
+    $email = trim($_POST['email'] ?? '');
+    $password = trim($_POST['password'] ?? '');
+    
+    if(empty($email) || empty($password)){
+        $message = "❌ Please fill in all fields";
+    } else {
+        $stmt = $conn->prepare("SELECT student_id, name, email, course_id, year FROM students WHERE email = ? AND password = ? AND deleted = 0 AND status = 'active'");
+        $stmt->bind_param("ss", $email, $password);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        
+        if($result->num_rows > 0){
+            $student = $result->fetch_assoc();
+            $_SESSION['student_id'] = $student['student_id'];
+            $_SESSION['student_name'] = $student['name'];
+            $_SESSION['course_id'] = $student['course_id'];
+            $_SESSION['year'] = $student['year'];
+            $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+            
             header("Location: dashboard.php");
             exit();
         } else {
-            $message = "Wrong password!";
+            $message = "❌ Invalid email or password, or account not active";
         }
-    } else {
-        $message = "Account not found or inactive!";
+        $stmt->close();
     }
 }
+
 ?>
 
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Student Login</title>
-  <style>
-    /* Reuse student colors */
-    :root {
-      --midnight-garden: #566947; /* This was the first color */
-      --caramelized: #c49a82;
-      --skipping-stones: #8fb3c1;
-      --terra-rosa: #c46a6a;
-      --art-craft: #000000;
-      --wild-blue: #bfe3f5;
-      --minty-fresh: #d9f2e6; /* This was the second color */
-      --honey-glow: #f2c66d;
-      --white: #ffffff;
-    }
+    <title>Student Login - CSMS</title>
+    <link rel="stylesheet" href="../assets/css/auth.css">
+    <style>
+        body {
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            padding: 20px;
+        }
 
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-      font-family: "Segoe UI", Tahoma, sans-serif;
-    }
+        .auth-card {
+            background: white;
+            width: 100%;
+            max-width: 500px;
+            padding: 40px 30px;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
+        }
 
-    body {
-      min-height: 100vh;
-      background: linear-gradient(135deg, var(--minty-fresh), var(--midnight-garden)); /* Swapped the gradient colors */
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      overflow: hidden;
-      transition: background 0.6s ease;
-    }
+        h2 {
+            text-align: center;
+            color: #1a1a2e;
+            margin-bottom: 10px;
+            font-size: 24px;
+        }
 
-    body.light {
-      background: #1f242b; /* Dark mode stays here */
-    }
+        .subtitle {
+            text-align: center;
+            color: #7f8c8d;
+            margin-bottom: 30px;
+            font-size: 13px;
+        }
 
-    body.light .auth-card {
-      background: var(--white); /* Keep white background for the form */
-    }
+        .form-group {
+            margin-bottom: 20px;
+        }
 
-    /* Lamp */
-    .lamp-container {
-      position: absolute;
-      top: 60px;
-      left: 50%;
-      transform: translateX(-50%);
-      cursor: pointer;
-      z-index: 1;
-    }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #2c3e50;
+            font-size: 13px;
+        }
 
-    /* Lamp Shape */
-    .lamp {
-      width: 120px;
-      height: 60px;
-      background: #fff;
-      border-radius: 60px 60px 0 0;
-      position: relative;
-      box-shadow: 0 0 15px rgba(242, 198, 109, 0.5); /* Glow Effect */
-      transition: box-shadow 0.5s ease;
-    }
+        input[type="email"],
+        input[type="password"] {
+            width: 100%;
+            padding: 12px 15px;
+            border: 2px solid #ecf0f1;
+            border-radius: 6px;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
 
-    .lamp::after {
-      content: "";
-      width: 6px;
-      height: 100px;
-      background: #ddd;
-      position: absolute;
-      left: 50%;
-      transform: translateX(-50%);
-      top: 60px;
-    }
+        input[type="email"]:focus,
+        input[type="password"]:focus {
+            outline: none;
+            border-color: #16a085;
+            box-shadow: 0 0 0 3px rgba(22, 160, 133, 0.1);
+        }
 
-    /* Lamp Chain */
-    .chain {
-      width: 6px;
-      height: 40px;
-      background: #aaa;
-      margin: auto;
-      position: absolute;
-      top: 130px;
-      left: 50%;
-      transform: translateX(-50%);
-      cursor: pointer;
-      border-radius: 50%;
-    }
+        .password-group {
+            position: relative;
+        }
 
-    /* Light Beam Spotlight Effect */
-    .light-spot {
-      position: absolute;
-      top: 0;
-      left: 50%;
-      width: 400px;
-      height: 400px;
-      background: radial-gradient(circle, rgba(255, 255, 255, 0.6) 10%, transparent 50%);
-      filter: blur(20px);
-      pointer-events: none;
-      opacity: 0;
-      transition: opacity 0.5s ease;
-    }
+        .password-toggle {
+            position: absolute;
+            right: 12px;
+            top: 40px;
+            background: none;
+            border: none;
+            color: #16a085;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            padding: 0;
+        }
 
-    /* Card */
-    .auth-card {
-      width: 420px;
-      background: var(--white);
-      padding: 30px;
-      border-radius: 18px;
-      box-shadow: 0 20px 45px rgba(0,0,0,0.15);
-      opacity: 0;
-      transform: translateY(20px);
-      transition: all 0.6s ease;
-    }
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 20px;
+            font-size: 13px;
+        }
 
-    body.light .auth-card {
-      opacity: 1;
-      transform: translateY(0);
-    }
+        .checkbox-group a {
+            color: #16a085;
+            text-decoration: none;
+            font-weight: 600;
+        }
 
-    .auth-card h2 {
-      text-align: center;
-      color: var(--art-craft);
-      margin-bottom: 8px;
-    }
+        button {
+            width: 100%;
+            padding: 12px;
+            background: linear-gradient(135deg, #16a085, #117a65);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-weight: 600;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
 
-    .auth-card p {
-      text-align: center;
-      color: #666;
-      margin-bottom: 25px;
-    }
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 16px rgba(22, 160, 133, 0.3);
+        }
 
-    .form-group {
-      margin-bottom: 15px;
-    }
+        .message {
+            background: #fadbd8;
+            color: #c0392b;
+            padding: 12px 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            font-size: 13px;
+            border-left: 4px solid #c0392b;
+        }
 
-    .form-group label {
-      display: block;
-      font-size: 14px;
-      color: var(--art-craft);
-      margin-bottom: 6px;
-    }
+        .back-link {
+            text-align: center;
+            margin-top: 20px;
+        }
 
-    .form-group input,
-    .form-group select {
-      width: 100%;
-      padding: 12px;
-      border-radius: 10px;
-      border: 1px solid #566947;
-      outline: none;
-    }
+        .back-link a {
+            color: #16a085;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 13px;
+        }
 
-    .form-group input:focus,
-    .form-group select:focus {
-      border-color: var(--skipping-stones);
-    }
-
-    .btn {
-      width: 100%;
-      padding: 12px;
-      background: linear-gradient(135deg, var(--terra-rosa), var(--honey-glow));
-      border: none;
-      border-radius: 12px;
-      color: white;
-      font-size: 16px;
-      cursor: pointer;
-    }
-
-    .btn:hover {
-      opacity: 0.9;
-    }
-
-    .message {
-      text-align: center;
-      color: var(--terra-rosa);
-      margin-bottom: 12px;
-    }
-
-    .auth-links {
-      text-align: center;
-      margin-top: 15px;
-    }
-
-    .auth-links a {
-      color: var(--midnight-garden);
-      text-decoration: none;
-    }
-  </style>
+        .back-link a:hover {
+            text-decoration: underline;
+        }
+    </style>
 </head>
-<body class="<?php echo isset($_SESSION['role']) && $_SESSION['role'] === 'admin' ? 'admin' : 'student'; ?>">
+<body>
 
-<!-- Light Beam Effect -->
-<div class="light-spot" id="lightSpot"></div>
+<div class="auth-card">
+    <h2>👨‍🎓 Student Login</h2>
+    <p class="subtitle">View your courses, modules, and results</p>
 
-<div class="lamp-container">
-  <div class="lamp" id="lampSVG"></div>
-  <div class="chain" onclick="toggleLamp()"></div>
+    <?php if($message): ?>
+        <div class="message"><?= htmlspecialchars($message) ?></div>
+    <?php endif; ?>
+
+    <form method="POST">
+        <div class="form-group">
+            <label>Email Address</label>
+            <input type="email" name="email" placeholder="Enter your email" required>
+        </div>
+
+        <div class="form-group password-group">
+            <label>Password</label>
+            <input type="password" name="password" id="student-password" placeholder="Enter your password" required>
+            <button type="button" class="password-toggle" onclick="toggleStudentPassword()">Show</button>
+        </div>
+
+        <div class="checkbox-group">
+            <label style="margin-bottom: 0;">
+                <input type="checkbox" name="remember"> Remember me
+            </label>
+            <a href="#">Forgot password?</a>
+        </div>
+
+        <button type="submit">Continue</button>
+    </form>
+
+    <div class="back-link">
+        <a href="../index.php">← Back to Login Page</a>
+    </div>
 </div>
 
-<div class="auth-card" id="loginForm">
-  <h2>Student Login</h2>
-  <p>Welcome back</p>
-
-  <?php if ($message): ?>
-    <div class="message"><?= $message ?></div>
-  <?php endif; ?>
-
-  <form method="POST">
-    <div class="form-group">
-      <label>Email</label>
-      <input type="email" name="email" id="emailInput" required>
-    </div>
-
-    <div class="form-group">
-      <label>Password</label>
-      <input type="password" name="password" required>
-    </div>
-
-    <button class="btn" name="login">Login</button>
-  </form>
-
-  <div class="auth-links">
-    <a href="forgot_password.php">Forgot your password?</a> |
-    <a href="register.php">Create account</a>
-  </div>
-</div>
-
-<script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.9.1/gsap.min.js"></script>
 <script>
-  let isOn = localStorage.getItem("lampState") === "on"; // Remember lamp state
-  const clickSound = new Audio('click-sound.mp3'); // Make sure you have a click-sound.mp3 file
-
-  function toggleLamp() {
-    isOn = !isOn;
-    localStorage.setItem("lampState", isOn ? "on" : "off");
-
-    if (isOn) {
-      document.body.classList.add("light");
-      document.getElementById("lightSpot").style.opacity = 1;
-      gsap.to("#lampSVG", { boxShadow: "0 0 30px rgba(242, 198, 109, 0.7)", duration: 0.5 }); // Increased glow intensity
-      document.getElementById("emailInput").focus();
-    } else {
-      document.body.classList.remove("light");
-      document.getElementById("lightSpot").style.opacity = 0;
-      gsap.to("#lampSVG", { boxShadow: "0 0 15px rgba(242, 198, 109, 0.5)", duration: 0.5 }); // Reduced glow intensity
+    function toggleStudentPassword() {
+        const passwordField = document.getElementById('student-password');
+        if (passwordField.type === 'password') {
+            passwordField.type = 'text';
+            event.target.textContent = 'Hide';
+        } else {
+            passwordField.type = 'password';
+            event.target.textContent = 'Show';
+        }
     }
-    clickSound.play();
-  }
-
-  // Initialize lamp state based on saved state
-  if (isOn) {
-    toggleLamp(); // Automatically turn on lamp if state was saved as "on"
-  }
 </script>
 
 </body>
