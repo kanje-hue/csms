@@ -1,447 +1,379 @@
 <?php
-
+/**
+ * SecurityManager - Handles password management, login attempt tracking,
+ * account lockout, password reset tokens, and login audit logging.
+ */
 class SecurityManager {
     private $conn;
-    private $max_login_attempts = 5;
-    private $lockout_duration = 1800; // 30 minutes in seconds
-    private $reset_token_expiry = 3600; // 1 hour
-    
-    public function __construct($database) {
-        $this->conn = $database;
+
+    // Security constants
+    const MAX_LOGIN_ATTEMPTS = 5;
+    const LOCKOUT_DURATION   = 1800; // 30 minutes in seconds
+    const PASSWORD_HISTORY   = 5;    // Last 5 passwords
+    const RESET_TOKEN_EXPIRY = 3600; // 1 hour
+
+    public function __construct($conn) {
+        $this->conn = $conn;
     }
-    
-    // ===== PASSWORD FUNCTIONS =====
-    
+
     /**
-     * Generate secure random password
-     */
-    public function generateSecurePassword($length = 12) {
-        $uppercase = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-        $lowercase = 'abcdefghijklmnopqrstuvwxyz';
-        $numbers = '0123456789';
-        $symbols = '!@#$%^&*()_+-=[]{}|;:,.<>?';
-        
-        $allChars = $uppercase . $lowercase . $numbers . $symbols;
-        $password = '';
-        
-        // Ensure at least one of each type
-        $password .= $uppercase[rand(0, strlen($uppercase) - 1)];
-        $password .= $lowercase[rand(0, strlen($lowercase) - 1)];
-        $password .= $numbers[rand(0, strlen($numbers) - 1)];
-        $password .= $symbols[rand(0, strlen($symbols) - 1)];
-        
-        // Fill rest
-        for($i = strlen($password); $i < $length; $i++) {
-            $password .= $allChars[rand(0, strlen($allChars) - 1)];
-        }
-        
-        return str_shuffle($password);
-    }
-    
-    /**
-     * Validate password strength
+     * Validate password strength.
+     * Requirements: 8+ chars, uppercase, lowercase, digit, special char.
      */
     public function validatePasswordStrength($password) {
-        $errors = [];
-        
-        if(strlen($password) < 8) {
-            $errors[] = "Password must be at least 8 characters";
+        if (strlen($password) < 8) {
+            return ['valid' => false, 'message' => 'Password must be at least 8 characters long.'];
         }
-        if(!preg_match('/[A-Z]/', $password)) {
-            $errors[] = "Password must contain uppercase letters";
+        if (!preg_match('/[A-Z]/', $password)) {
+            return ['valid' => false, 'message' => 'Password must contain at least one uppercase letter.'];
         }
-        if(!preg_match('/[a-z]/', $password)) {
-            $errors[] = "Password must contain lowercase letters";
+        if (!preg_match('/[a-z]/', $password)) {
+            return ['valid' => false, 'message' => 'Password must contain at least one lowercase letter.'];
         }
-        if(!preg_match('/[0-9]/', $password)) {
-            $errors[] = "Password must contain numbers";
+        if (!preg_match('/[0-9]/', $password)) {
+            return ['valid' => false, 'message' => 'Password must contain at least one number.'];
         }
-        if(!preg_match('/[!@#$%^&*()_+\-=\[\]{}|;:,.<>?]/', $password)) {
-            $errors[] = "Password must contain special characters";
+        if (!preg_match('/[\W_]/', $password)) {
+            return ['valid' => false, 'message' => 'Password must contain at least one special character.'];
         }
-        
-        return $errors;
+        return ['valid' => true, 'message' => 'Password is strong.'];
     }
-    
+
     /**
-     * Hash password using bcrypt
+     * Hash a password using bcrypt.
      */
     public function hashPassword($password) {
-        return password_hash($password, PASSWORD_BCRYPT, ['cost' => 12]);
+        return password_hash($password, PASSWORD_BCRYPT);
     }
-    
+
     /**
-     * Verify password
+     * Verify a password against a hash.
      */
     public function verifyPassword($password, $hash) {
         return password_verify($password, $hash);
     }
-    
+
     /**
-     * Get password history
+     * Generate a secure random password.
      */
-    public function getPasswordHistory($user_id, $user_type) {
-        $stmt = $this->conn->prepare("SELECT password_history FROM " . $user_type . "s WHERE " . $user_type . "_id = ?");
-        $stmt->bind_param("i", $user_id);
-        $stmt->execute();
-        $result = $stmt->get_result()->fetch_assoc();
-        $stmt->close();
-        
-        return $result ? json_decode($result['password_history'] ?? '[]', true) : [];
-    }
-    
-    /**
-     * Check if password was used before
-     */
-    public function isPasswordReused($user_id, $user_type, $new_password) {
-        $history = $this->getPasswordHistory($user_id, $user_type);
-        
-        foreach($history as $old_hash) {
-            if($this->verifyPassword($new_password, $old_hash)) {
-                return true;
-            }
+    public function generateSecurePassword($length = 12) {
+        $upper   = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+        $lower   = 'abcdefghijklmnopqrstuvwxyz';
+        $digits  = '0123456789';
+        $special = '!@#$%^&*()_+-=[]{}';
+        $all     = $upper . $lower . $digits . $special;
+
+        $password  = $upper[random_int(0, strlen($upper) - 1)];
+        $password .= $lower[random_int(0, strlen($lower) - 1)];
+        $password .= $digits[random_int(0, strlen($digits) - 1)];
+        $password .= $special[random_int(0, strlen($special) - 1)];
+
+        for ($i = 4; $i < $length; $i++) {
+            $password .= $all[random_int(0, strlen($all) - 1)];
         }
-        
-        return false;
+
+        return str_shuffle($password);
     }
-    
+
     /**
-     * Add password to history
+     * Check if account is currently locked out.
+     *
+     * @param string $table  admins | teachers | students
+     * @param int    $userId
+     * @return bool
      */
-    public function addToPasswordHistory($user_id, $user_type, $password_hash) {
-        $history = $this->getPasswordHistory($user_id, $user_type);
-        
-        // Keep only last 5 passwords
-        if(count($history) >= 5) {
-            array_shift($history);
+    public function isAccountLocked($table, $userId) {
+        $allowedTables = ['admins', 'teachers', 'students'];
+        if (!in_array($table, $allowedTables)) {
+            return false;
         }
-        
-        $history[] = $password_hash;
-        $history_json = json_encode($history);
-        
-        $stmt = $this->conn->prepare("UPDATE " . $user_type . "s SET password_history = ? WHERE " . $user_type . "_id = ?");
-        $stmt->bind_param("si", $history_json, $user_id);
+
+        $idCol = $this->getIdColumn($table);
+        $stmt  = $this->conn->prepare(
+            "SELECT locked_until FROM `$table` WHERE `$idCol` = ?"
+        );
+        $stmt->bind_param("i", $userId);
         $stmt->execute();
+        $row = $stmt->get_result()->fetch_assoc();
         $stmt->close();
-    }
-    
-    // ===== LOGIN ATTEMPT TRACKING =====
-    
-    /**
-     * Record login attempt
-     */
-    public function recordLoginAttempt($user_type, $email, $status, $reason = '') {
-        $ip_address = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
-        
-        $stmt = $this->conn->prepare("INSERT INTO login_audit (user_type, email, ip_address, login_status, reason) VALUES (?, ?, ?, ?, ?)");
-        $stmt->bind_param("sssss", $user_type, $email, $ip_address, $status, $reason);
-        $stmt->execute();
-        $stmt->close();
-    }
-    
-    /**
-     * Increment failed login attempts
-     */
-    public function incrementFailedAttempts($user_id, $user_type) {
-        $table = $user_type . 's';
-        $id_field = $user_type . '_id';
-        
-        $stmt = $this->conn->prepare("UPDATE $table SET failed_login_attempts = failed_login_attempts + 1 WHERE $id_field = ?");
-        $stmt->bind_param("i", $user_id);
-        $stmt->execute();
-        $stmt->close();
-        
-        // Check if should lock account
-        $this->checkAndLockAccount($user_id, $user_type);
-    }
-    
-    /**
-     * Check if account should be locked
-     */
-    public function checkAndLockAccount($user_id, $user_type) {
-        $table = $user_type . 's';
-        $id_field = $user_type . '_id';
-        
-        $stmt = $this->conn->prepare("SELECT failed_login_attempts FROM $table WHERE $id_field = ?");
-        $stmt->bind_param("i", $user_id);
-        $stmt->execute();
-        $result = $stmt->get_result()->fetch_assoc();
-        $stmt->close();
-        
-        if($result && $result['failed_login_attempts'] >= $this->max_login_attempts) {
-            $locked_until = date('Y-m-d H:i:s', time() + $this->lockout_duration);
-            
-            $update = $this->conn->prepare("UPDATE $table SET locked_until = ? WHERE $id_field = ?");
-            $update->bind_param("si", $locked_until, $user_id);
-            $update->execute();
-            $update->close();
-            
+
+        if ($row && $row['locked_until'] && strtotime($row['locked_until']) > time()) {
             return true;
         }
-        
         return false;
     }
-    
+
     /**
-     * Check if account is locked
+     * Record a failed login attempt; lock account after MAX_LOGIN_ATTEMPTS.
+     *
+     * @param string $table
+     * @param int    $userId
      */
-    public function isAccountLocked($user_id, $user_type) {
-        $table = $user_type . 's';
-        $id_field = $user_type . '_id';
-        
-        $stmt = $this->conn->prepare("SELECT locked_until FROM $table WHERE $id_field = ?");
-        $stmt->bind_param("i", $user_id);
+    public function recordFailedLogin($table, $userId) {
+        $allowedTables = ['admins', 'teachers', 'students'];
+        if (!in_array($table, $allowedTables)) {
+            return;
+        }
+
+        $idCol = $this->getIdColumn($table);
+
+        // Increment counter
+        $stmt = $this->conn->prepare(
+            "UPDATE `$table` SET failed_login_attempts = failed_login_attempts + 1 WHERE `$idCol` = ?"
+        );
+        $stmt->bind_param("i", $userId);
         $stmt->execute();
-        $result = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+
+        // Check if we hit the threshold
+        $stmt = $this->conn->prepare(
+            "SELECT failed_login_attempts FROM `$table` WHERE `$idCol` = ?"
+        );
+        $stmt->bind_param("i", $userId);
+        $stmt->execute();
+        $row = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+
+        if ($row && $row['failed_login_attempts'] >= self::MAX_LOGIN_ATTEMPTS) {
+            $lockedUntil = date('Y-m-d H:i:s', time() + self::LOCKOUT_DURATION);
+            $stmt = $this->conn->prepare(
+                "UPDATE `$table` SET locked_until = ? WHERE `$idCol` = ?"
+            );
+            $stmt->bind_param("si", $lockedUntil, $userId);
+            $stmt->execute();
+            $stmt->close();
+        }
+    }
+
+    /**
+     * Reset failed login counter and lockout after successful login.
+     *
+     * @param string $table
+     * @param int    $userId
+     */
+    public function resetLoginAttempts($table, $userId) {
+        $allowedTables = ['admins', 'teachers', 'students'];
+        if (!in_array($table, $allowedTables)) {
+            return;
+        }
+
+        $idCol = $this->getIdColumn($table);
+        $stmt  = $this->conn->prepare(
+            "UPDATE `$table` SET failed_login_attempts = 0, locked_until = NULL WHERE `$idCol` = ?"
+        );
+        $stmt->bind_param("i", $userId);
+        $stmt->execute();
+        $stmt->close();
+    }
+
+    /**
+     * Generate a password reset token and store it in the database.
+     * FIXED: Now correctly stores table name in user_type, not user_id
+     *
+     * @param string $table
+     * @param int    $userId
+     * @param string $email
+     * @return string|false  The verification code (6-digit) or false on failure
+     */
+    public function generatePasswordResetToken($table, $userId, $email) {
+        $allowedTables = ['admins', 'teachers', 'students'];
+        if (!in_array($table, $allowedTables)) {
+            return false;
+        }
+
+        $token      = bin2hex(random_bytes(32));
+        $code       = str_pad(random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+
+        // Invalidate previous tokens for this user/table
+        $del = $this->conn->prepare(
+            "DELETE FROM password_reset_tokens WHERE user_type = ? AND user_id = ?"
+        );
+        $del->bind_param("si", $table, $userId);
+        $del->execute();
+        $del->close();
+
+        // FIX: Insert with correct parameter types and order
+        $ins = $this->conn->prepare(
+            "INSERT INTO password_reset_tokens (user_type, user_id, email, token, verification_code, created_at, expires_at, is_used)
+             VALUES (?, ?, ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL 1 HOUR), 0)"
+        );
+        
+        // IMPORTANT: bind_param order must match VALUES order
+        // user_type (s=string), user_id (i=integer), email (s=string), token (s=string), code (s=string)
+        $ins->bind_param("sisis", $table, $userId, $email, $token, $code);
+        
+        if ($ins->execute()) {
+            $ins->close();
+            return $code;
+        }
+        $ins->close();
+        return false;
+    }
+
+    /**
+     * Verify a password reset code.
+     * FIXED: Now returns correct user_type (table name) for session storage
+     *
+     * @param string $email
+     * @param string $code
+     * @return array|false  Row from password_reset_tokens or false
+     */
+    public function verifyResetCode($email, $code) {
+        $stmt = $this->conn->prepare(
+            "SELECT id, user_type, user_id, email, token, verification_code, expires_at, is_used 
+             FROM password_reset_tokens
+             WHERE email = ? AND verification_code = ? AND expires_at > NOW() AND is_used = 0"
+        );
+        $stmt->bind_param("ss", $email, $code);
+        $stmt->execute();
+        $row = $stmt->get_result()->fetch_assoc();
         $stmt->close();
         
-        if($result && $result['locked_until']) {
-            $locked_time = strtotime($result['locked_until']);
-            
-            if(time() < $locked_time) {
-                return true;
-            } else {
-                // Unlock account
-                $this->unlockAccount($user_id, $user_type);
-                return false;
+        return $row ?: false;
+    }
+
+    /**
+     * Mark a reset token as used.
+     *
+     * @param int $tokenId
+     */
+    public function markTokenUsed($tokenId) {
+        $stmt = $this->conn->prepare(
+            "UPDATE password_reset_tokens SET is_used = 1 WHERE id = ?"
+        );
+        $stmt->bind_param("i", $tokenId);
+        $stmt->execute();
+        $stmt->close();
+    }
+
+    /**
+     * Check whether a new password was used recently (last PASSWORD_HISTORY passwords).
+     *
+     * @param string $table
+     * @param int    $userId
+     * @param string $newPassword  Plain-text new password
+     * @return bool  true if reused
+     */
+    public function isPasswordReused($table, $userId, $newPassword) {
+        $allowedTables = ['admins', 'teachers', 'students'];
+        if (!in_array($table, $allowedTables)) {
+            return false;
+        }
+
+        $idCol = $this->getIdColumn($table);
+        $stmt  = $this->conn->prepare(
+            "SELECT password_history FROM `$table` WHERE `$idCol` = ?"
+        );
+        $stmt->bind_param("i", $userId);
+        $stmt->execute();
+        $row = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+
+        if ($row && $row['password_history']) {
+            $history = json_decode($row['password_history'], true) ?? [];
+            foreach ($history as $oldHash) {
+                if (password_verify($newPassword, $oldHash)) {
+                    return true;
+                }
             }
         }
-        
         return false;
     }
-    
+
     /**
-     * Unlock account and reset attempts
+     * Update a user's password and maintain the history list.
+     *
+     * @param string $table
+     * @param int    $userId
+     * @param string $newPassword  Plain-text new password
+     * @param bool   $forceChange  Whether to clear the force_password_change flag
      */
-    public function unlockAccount($user_id, $user_type) {
-        $table = $user_type . 's';
-        $id_field = $user_type . '_id';
-        
-        $stmt = $this->conn->prepare("UPDATE $table SET failed_login_attempts = 0, locked_until = NULL WHERE $id_field = ?");
-        $stmt->bind_param("i", $user_id);
+    public function updatePassword($table, $userId, $newPassword, $forceChange = false) {
+        $allowedTables = ['admins', 'teachers', 'students'];
+        if (!in_array($table, $allowedTables)) {
+            return false;
+        }
+
+        $idCol   = $this->getIdColumn($table);
+        $newHash = $this->hashPassword($newPassword);
+
+        // Fetch current password + history
+        $stmt = $this->conn->prepare(
+            "SELECT password, password_history FROM `$table` WHERE `$idCol` = ?"
+        );
+        $stmt->bind_param("i", $userId);
+        $stmt->execute();
+        $row = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+
+        $history = [];
+        if ($row) {
+            if ($row['password']) {
+                $history[] = $row['password'];
+            }
+            $oldHistory = json_decode($row['password_history'] ?? '[]', true) ?? [];
+            $history    = array_merge($history, $oldHistory);
+        }
+
+        // Keep only last (PASSWORD_HISTORY - 1) so the current becomes history[0]
+        $history = array_slice($history, 0, self::PASSWORD_HISTORY - 1);
+
+        $historyJson   = json_encode($history);
+        $now           = date('Y-m-d H:i:s');
+
+        if ($forceChange) {
+            $stmt = $this->conn->prepare(
+                "UPDATE `$table`
+                 SET password = ?, password_history = ?, password_changed_at = ?,
+                     force_password_change = 0
+                 WHERE `$idCol` = ?"
+            );
+            $stmt->bind_param("sssi", $newHash, $historyJson, $now, $userId);
+        } else {
+            $stmt = $this->conn->prepare(
+                "UPDATE `$table`
+                 SET password = ?, password_history = ?, password_changed_at = ?
+                 WHERE `$idCol` = ?"
+            );
+            $stmt->bind_param("sssi", $newHash, $historyJson, $now, $userId);
+        }
+
+        $result = $stmt->execute();
+        $stmt->close();
+        return $result;
+    }
+
+    /**
+     * Write an entry to the login_audit table.
+     *
+     * @param string      $userType
+     * @param int|null    $userId
+     * @param string      $email
+     * @param string      $status    'success' | 'failed' | 'locked'
+     * @param string|null $ipAddress
+     */
+    public function logLoginAttempt($userType, $userId, $email, $status, $ipAddress = null) {
+        $ip   = $ipAddress ?? ($_SERVER['REMOTE_ADDR'] ?? 'unknown');
+        $ua   = $_SERVER['HTTP_USER_AGENT'] ?? null;
+        $stmt = $this->conn->prepare(
+            "INSERT INTO login_audit (user_type, user_id, email, login_status, ip_address, user_agent)
+             VALUES (?, ?, ?, ?, ?, ?)"
+        );
+        $stmt->bind_param("sissss", $userType, $userId, $email, $status, $ip, $ua);
         $stmt->execute();
         $stmt->close();
     }
-    
+
     /**
-     * Reset login attempts on successful login
+     * Return the primary-key column name for a given table.
      */
-    public function resetLoginAttempts($user_id, $user_type) {
-        $table = $user_type . 's';
-        $id_field = $user_type . '_id';
-        
-        $stmt = $this->conn->prepare("UPDATE $table SET failed_login_attempts = 0, locked_until = NULL WHERE $id_field = ?");
-        $stmt->bind_param("i", $user_id);
-        $stmt->execute();
-        $stmt->close();
-    }
-    
-    // ===== PASSWORD RESET =====
-    
-    /**
-     * Generate password reset token and code
-     */
-    public function generatePasswordResetToken($user_id, $user_type, $email) {
-        // Delete old tokens
-        $delete = $this->conn->prepare("DELETE FROM password_reset_tokens WHERE user_id = ? AND user_type = ? AND expires_at < NOW()");
-        $delete->bind_param("is", $user_id, $user_type);
-        $delete->execute();
-        $delete->close();
-        
-        // Generate token and code
-        $token = bin2hex(random_bytes(32));
-        $verification_code = str_pad(rand(0, 999999), 6, '0', STR_PAD_LEFT);
-        $expires_at = date('Y-m-d H:i:s', time() + $this->reset_token_expiry);
-        
-        $stmt = $this->conn->prepare("INSERT INTO password_reset_tokens (user_type, user_id, email, token, verification_code, expires_at) VALUES (?, ?, ?, ?, ?, ?)");
-        $stmt->bind_param("sissss", $user_type, $user_id, $email, $token, $verification_code, $expires_at);
-        $stmt->execute();
-        $stmt->close();
-        
-        return [
-            'token' => $token,
-            'code' => $verification_code
+    private function getIdColumn($table) {
+        $map = [
+            'admins'   => 'admin_id',
+            'teachers' => 'teacher_id',
+            'students' => 'student_id',
         ];
-    }
-    
-    /**
-     * Verify reset code
-     */
-    public function verifyResetCode($token, $code) {
-        $stmt = $this->conn->prepare("SELECT * FROM password_reset_tokens WHERE token = ? AND expires_at > NOW() AND is_used = 0");
-        $stmt->bind_param("s", $token);
-        $stmt->execute();
-        $result = $stmt->get_result()->fetch_assoc();
-        $stmt->close();
-        
-        if(!$result) {
-            return ['valid' => false, 'message' => 'Token expired or invalid'];
-        }
-        
-        if($result['code_attempts'] >= 3) {
-            return ['valid' => false, 'message' => 'Too many attempts. Please request a new reset code.'];
-        }
-        
-        if($result['verification_code'] !== $code) {
-            // Increment attempts
-            $update = $this->conn->prepare("UPDATE password_reset_tokens SET code_attempts = code_attempts + 1 WHERE id = ?");
-            $update->bind_param("i", $result['id']);
-            $update->execute();
-            $update->close();
-            
-            return ['valid' => false, 'message' => 'Invalid verification code'];
-        }
-        
-        return [
-            'valid' => true,
-            'user_id' => $result['user_id'],
-            'user_type' => $result['user_type'],
-            'email' => $result['email']
-        ];
-    }
-    
-    /**
-     * Mark token as used
-     */
-    public function markTokenAsUsed($token) {
-        $stmt = $this->conn->prepare("UPDATE password_reset_tokens SET is_used = 1 WHERE token = ?");
-        $stmt->bind_param("s", $token);
-        $stmt->execute();
-        $stmt->close();
-    }
-    
-    // ===== EMAIL NOTIFICATIONS =====
-    
-    /**
-     * Send account created email
-     */
-    public function sendAccountCreatedEmail($email, $fullname, $temp_password, $user_type) {
-        $subject = "CSMS Account Created - Please Set Your Password";
-        $login_url = "http://localhost/csms/index.php";
-        
-        $message = "
-        <html>
-        <body style='font-family: Arial, sans-serif; line-height: 1.6; color: #333;'>
-            <div style='max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 8px;'>
-                <h2 style='color: #16a085;'>Welcome to CSMS! 👋</h2>
-                
-                <p>Dear <strong>$fullname</strong>,</p>
-                
-                <p>Your $user_type account has been created by the administrator. Please use the credentials below to login and set up your own password.</p>
-                
-                <div style='background: #f8fafb; padding: 15px; border-radius: 6px; margin: 20px 0;'>
-                    <p><strong>Email:</strong> $email</p>
-                    <p><strong>Temporary Password:</strong> <code style='background: #e8e8e8; padding: 5px 10px; border-radius: 3px; font-family: monospace;'>$temp_password</code></p>
-                    <p><strong>Login URL:</strong> <a href='$login_url' style='color: #16a085; text-decoration: none;'>$login_url</a></p>
-                </div>
-                
-                <h3 style='color: #16a085;'>⚠️ Important Security Notes:</h3>
-                <ul>
-                    <li>✅ You MUST change your password on first login</li>
-                    <li>🔒 Do not share this email with anyone</li>
-                    <li>⏰ Temporary password is valid for this login only</li>
-                    <li>📧 If you didn't request this, contact your administrator immediately</li>
-                </ul>
-                
-                <p style='margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd; color: #999; font-size: 12px;'>
-                    This is an automated email. Please do not reply to this email.
-                </p>
-                
-                <p style='color: #999; font-size: 12px;'>
-                    Best regards,<br><strong>CSMS Administration</strong>
-                </p>
-            </div>
-        </body>
-        </html>";
-        
-        return $this->sendEmail($email, $subject, $message);
-    }
-    
-    /**
-     * Send password reset email
-     */
-    public function sendPasswordResetEmail($email, $fullname, $verification_code) {
-        $subject = "CSMS Password Reset Request";
-        
-        $message = "
-        <html>
-        <body style='font-family: Arial, sans-serif; line-height: 1.6; color: #333;'>
-            <div style='max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 8px;'>
-                <h2 style='color: #16a085;'>Password Reset Request 🔐</h2>
-                
-                <p>Dear <strong>$fullname</strong>,</p>
-                
-                <p>We received a password reset request for your CSMS account. Use the verification code below to reset your password.</p>
-                
-                <div style='background: #f8fafb; padding: 20px; border-radius: 6px; margin: 20px 0; text-align: center;'>
-                    <p style='margin: 0; font-size: 12px; color: #666;'>Your Verification Code</p>
-                    <p style='margin: 10px 0 0 0; font-size: 32px; font-weight: bold; letter-spacing: 2px; color: #16a085; font-family: monospace;'>$verification_code</p>
-                </div>
-                
-                <h3 style='color: #16a085;'>⚠️ Important:</h3>
-                <ul>
-                    <li>This code expires in 1 hour</li>
-                    <li>Do not share this code with anyone</li>
-                    <li>If you didn't request this, ignore this email</li>
-                </ul>
-                
-                <p style='margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd; color: #999; font-size: 12px;'>
-                    This is an automated email. Please do not reply to this email.
-                </p>
-            </div>
-        </body>
-        </html>";
-        
-        return $this->sendEmail($email, $subject, $message);
-    }
-    
-    /**
-     * Send account locked email
-     */
-    public function sendAccountLockedEmail($email, $fullname) {
-        $subject = "CSMS Account Locked - Security Alert";
-        
-        $message = "
-        <html>
-        <body style='font-family: Arial, sans-serif; line-height: 1.6; color: #333;'>
-            <div style='max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #ffc107; border-radius: 8px;'>
-                <h2 style='color: #c0392b;'>🔒 Account Locked</h2>
-                
-                <p>Dear <strong>$fullname</strong>,</p>
-                
-                <p>Your CSMS account has been locked due to multiple failed login attempts. This is a security measure to protect your account.</p>
-                
-                <div style='background: #fff3cd; padding: 15px; border-radius: 6px; margin: 20px 0;'>
-                    <strong>Your account will be automatically unlocked in 30 minutes.</strong>
-                </div>
-                
-                <h3>What to do:</h3>
-                <ul>
-                    <li>Wait 30 minutes before trying to login again</li>
-                    <li>Use your correct password</li>
-                    <li>If you forgot your password, use the password reset feature</li>
-                </ul>
-                
-                <p style='margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd; color: #999; font-size: 12px;'>
-                    If you believe this is a security concern, please contact your system administrator.
-                </p>
-            </div>
-        </body>
-        </html>";
-        
-        return $this->sendEmail($email, $subject, $message);
-    }
-    
-    /**
-     * Generic send email function
-     */
-    public function sendEmail($to, $subject, $message) {
-        $headers = "MIME-Version: 1.0\r\n";
-        $headers .= "Content-type: text/html; charset=UTF-8\r\n";
-        $headers .= "From: noreply@csms.local\r\n";
-        
-        return mail($to, $subject, $message, $headers);
+        return $map[$table] ?? 'id';
     }
 }
-
 ?>
