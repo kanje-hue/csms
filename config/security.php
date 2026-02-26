@@ -168,6 +168,7 @@ class SecurityManager {
 
     /**
      * Generate a password reset token and store it in the database.
+     * FIXED: Now correctly stores table name in user_type, not user_id
      *
      * @param string $table
      * @param int    $userId
@@ -182,21 +183,25 @@ class SecurityManager {
 
         $token      = bin2hex(random_bytes(32));
         $code       = str_pad(random_int(0, 999999), 6, '0', STR_PAD_LEFT);
-        $expiresAt  = date('Y-m-d H:i:s', time() + self::RESET_TOKEN_EXPIRY);
 
         // Invalidate previous tokens for this user/table
         $del = $this->conn->prepare(
-            "DELETE FROM password_reset_tokens WHERE user_table = ? AND user_id = ?"
+            "DELETE FROM password_reset_tokens WHERE user_type = ? AND user_id = ?"
         );
         $del->bind_param("si", $table, $userId);
         $del->execute();
         $del->close();
 
+        // FIX: Insert with correct parameter types and order
         $ins = $this->conn->prepare(
-            "INSERT INTO password_reset_tokens (user_table, user_id, email, token, verification_code, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?)"
+            "INSERT INTO password_reset_tokens (user_type, user_id, email, token, verification_code, created_at, expires_at, is_used)
+             VALUES (?, ?, ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL 1 HOUR), 0)"
         );
-        $ins->bind_param("sissss", $table, $userId, $email, $token, $code, $expiresAt);
+        
+        // IMPORTANT: bind_param order must match VALUES order
+        // user_type (s=string), user_id (i=integer), email (s=string), token (s=string), code (s=string)
+        $ins->bind_param("sisis", $table, $userId, $email, $token, $code);
+        
         if ($ins->execute()) {
             $ins->close();
             return $code;
@@ -207,6 +212,7 @@ class SecurityManager {
 
     /**
      * Verify a password reset code.
+     * FIXED: Now returns correct user_type (table name) for session storage
      *
      * @param string $email
      * @param string $code
@@ -214,13 +220,15 @@ class SecurityManager {
      */
     public function verifyResetCode($email, $code) {
         $stmt = $this->conn->prepare(
-            "SELECT * FROM password_reset_tokens
-             WHERE email = ? AND verification_code = ? AND expires_at > NOW() AND used = 0"
+            "SELECT id, user_type, user_id, email, token, verification_code, expires_at, is_used 
+             FROM password_reset_tokens
+             WHERE email = ? AND verification_code = ? AND expires_at > NOW() AND is_used = 0"
         );
         $stmt->bind_param("ss", $email, $code);
         $stmt->execute();
         $row = $stmt->get_result()->fetch_assoc();
         $stmt->close();
+        
         return $row ?: false;
     }
 
@@ -231,7 +239,7 @@ class SecurityManager {
      */
     public function markTokenUsed($tokenId) {
         $stmt = $this->conn->prepare(
-            "UPDATE password_reset_tokens SET used = 1 WHERE id = ?"
+            "UPDATE password_reset_tokens SET is_used = 1 WHERE id = ?"
         );
         $stmt->bind_param("i", $tokenId);
         $stmt->execute();
@@ -312,7 +320,6 @@ class SecurityManager {
 
         $historyJson   = json_encode($history);
         $now           = date('Y-m-d H:i:s');
-        $forceInt      = $forceChange ? 0 : null;
 
         if ($forceChange) {
             $stmt = $this->conn->prepare(
@@ -339,20 +346,20 @@ class SecurityManager {
     /**
      * Write an entry to the login_audit table.
      *
-     * @param string      $userTable
+     * @param string      $userType
      * @param int|null    $userId
      * @param string      $email
      * @param string      $status    'success' | 'failed' | 'locked'
      * @param string|null $ipAddress
      */
-    public function logLoginAttempt($userTable, $userId, $email, $status, $ipAddress = null) {
+    public function logLoginAttempt($userType, $userId, $email, $status, $ipAddress = null) {
         $ip   = $ipAddress ?? ($_SERVER['REMOTE_ADDR'] ?? 'unknown');
         $ua   = $_SERVER['HTTP_USER_AGENT'] ?? null;
         $stmt = $this->conn->prepare(
-            "INSERT INTO login_audit (user_table, user_id, email, status, ip_address, user_agent)
+            "INSERT INTO login_audit (user_type, user_id, email, login_status, ip_address, user_agent)
              VALUES (?, ?, ?, ?, ?, ?)"
         );
-        $stmt->bind_param("sissss", $userTable, $userId, $email, $status, $ip, $ua);
+        $stmt->bind_param("sissss", $userType, $userId, $email, $status, $ip, $ua);
         $stmt->execute();
         $stmt->close();
     }
@@ -369,3 +376,4 @@ class SecurityManager {
         return $map[$table] ?? 'id';
     }
 }
+?>

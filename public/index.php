@@ -6,11 +6,10 @@ require_once '../config/email_config.php';
 
 $security = new SecurityManager($conn);
 
-$action  = $_GET['action'] ?? 'login';   // login | forgot | verify_code | reset
+$action  = $_GET['action'] ?? 'login';
 $message = '';
 $msgType = 'error';
 
-// ── Helper: redirect after successful login ───────────────────────────────────
 function redirectByRole($role) {
     $map = [
         'admin'   => '../admin/manage_courses.php',
@@ -21,11 +20,9 @@ function redirectByRole($role) {
     exit();
 }
 
-// ── POST handling ─────────────────────────────────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $postAction = $_POST['action'] ?? 'login';
 
-    // ── LOGIN ──────────────────────────────────────────────────────────────────
     if ($postAction === 'login') {
         $email    = trim($_POST['email'] ?? '');
         $password = $_POST['password'] ?? '';
@@ -39,7 +36,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $idCol = ($role === 'admin') ? 'admin_id' : (($role === 'teacher') ? 'teacher_id' : 'student_id');
             $nameCol = ($role === 'admin') ? 'name' : (($role === 'teacher') ? 'fullname' : 'name');
 
-            // Fetch user
             $deletedCond = ($role === 'student') ? "AND deleted = 0 AND status = 'active'" : "AND deleted = 0";
             $stmt = $conn->prepare(
                 "SELECT $idCol, $nameCol, email, password, force_password_change, locked_until, failed_login_attempts
@@ -63,7 +59,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $remaining = max(0, SecurityManager::MAX_LOGIN_ATTEMPTS - ($user['failed_login_attempts'] + 1));
                 $message   = "❌ Invalid email or password. $remaining attempt(s) remaining before lockout.";
             } else {
-                // Success
                 $security->resetLoginAttempts($table, $user[$idCol]);
                 $security->logLoginAttempt($table, $user[$idCol], $email, 'success');
 
@@ -85,7 +80,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
-    // ── STUDENT REGISTER ───────────────────────────────────────────────────────
     elseif ($postAction === 'register') {
         $regNumber = trim($_POST['reg_number'] ?? '');
         $name      = trim($_POST['name'] ?? '');
@@ -108,7 +102,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $message = '❌ ' . $pwCheck['message'];
             $action  = 'register';
         } else {
-            // Check duplicates
             $chk = $conn->prepare("SELECT student_id FROM students WHERE email = ? AND deleted = 0");
             $chk->bind_param("s", $email);
             $chk->execute();
@@ -137,7 +130,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
-    // ── FORGOT PASSWORD ────────────────────────────────────────────────────────
     elseif ($postAction === 'forgot') {
         $email = trim($_POST['email'] ?? '');
         $role  = $_POST['role'] ?? '';
@@ -165,7 +157,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     send_email($email, ucfirst($role), $subject, $body);
                 }
             }
-            // Show same message to avoid user enumeration
             $message = '✅ If that email is registered, a verification code has been sent.';
             $msgType = 'success';
             $action  = 'verify_code';
@@ -174,60 +165,98 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
-    // ── VERIFY CODE ────────────────────────────────────────────────────────────
     elseif ($postAction === 'verify_code') {
+        error_log("=== VERIFY CODE START ===");
+        
         $email = $_SESSION['reset_email'] ?? '';
         $code  = trim($_POST['code'] ?? '');
 
+        error_log("Email: $email, Code: $code");
+        
         $row = $security->verifyResetCode($email, $code);
+        
+        error_log("Query result: " . print_r($row, true));
+        
         if (!$row) {
+            error_log("Invalid or expired code");
             $message = '❌ Invalid or expired verification code.';
             $action  = 'verify_code';
         } else {
+            error_log("Code verified! Setting session variables:");
+            error_log("  id: {$row['id']}");
+            error_log("  user_type: {$row['user_type']}");
+            error_log("  user_id: {$row['user_id']}");
+            
             $_SESSION['reset_token_id']    = $row['id'];
-            $_SESSION['reset_user_table']  = $row['user_table'];
+            $_SESSION['reset_user_table']  = $row['user_type'];
             $_SESSION['reset_user_id']     = $row['user_id'];
-            $action = 'reset';
+            $_SESSION['reset_email']       = $email;
+            
+            error_log("Session set. Current session: " . print_r($_SESSION, true));
+            
+            $message = '✅ Code verified! Please create your new password.';
+            $msgType = 'success';
+            $action  = 'reset';
         }
+        error_log("=== VERIFY CODE END ===");
     }
 
-    // ── RESET PASSWORD ─────────────────────────────────────────────────────────
     elseif ($postAction === 'reset') {
+        error_log("=== RESET PASSWORD START ===");
+        error_log("Current session at start of reset: " . print_r($_SESSION, true));
+        
         $tokenId  = $_SESSION['reset_token_id']   ?? null;
         $table    = $_SESSION['reset_user_table'] ?? null;
         $userId   = $_SESSION['reset_user_id']    ?? null;
         $password = $_POST['password'] ?? '';
         $confirm  = $_POST['confirm_password'] ?? '';
 
+        error_log("tokenId: $tokenId, table: $table, userId: $userId");
+        
         if (!$tokenId || !$table || !$userId) {
+            error_log("ERROR: Missing session variables!");
+            error_log("  tokenId is " . ($tokenId ? "SET to: $tokenId" : "NULL"));
+            error_log("  table is " . ($table ? "SET to: $table" : "NULL"));
+            error_log("  userId is " . ($userId ? "SET to: $userId" : "NULL"));
+            
             $message = '❌ Invalid reset session. Please start over.';
             $action  = 'forgot';
+            unset($_SESSION['reset_token_id'], $_SESSION['reset_user_table'],
+                  $_SESSION['reset_user_id'], $_SESSION['reset_email'], $_SESSION['reset_role']);
+        } elseif (!$password || !$confirm) {
+            error_log("ERROR: Missing password fields");
+            $message = '❌ Please fill in all password fields.';
+            $action  = 'reset';
         } elseif ($password !== $confirm) {
+            error_log("ERROR: Passwords don't match");
             $message = '❌ Passwords do not match.';
             $action  = 'reset';
         } else {
             $pwCheck = $security->validatePasswordStrength($password);
             if (!$pwCheck['valid']) {
+                error_log("ERROR: Password strength check failed: " . $pwCheck['message']);
                 $message = '❌ ' . $pwCheck['message'];
                 $action  = 'reset';
             } elseif ($security->isPasswordReused($table, $userId, $password)) {
+                error_log("ERROR: Password reused");
                 $message = '❌ You cannot reuse one of your last ' . SecurityManager::PASSWORD_HISTORY . ' passwords.';
                 $action  = 'reset';
             } else {
+                error_log("Updating password for table: $table, userId: $userId");
                 $security->updatePassword($table, $userId, $password, true);
                 $security->markTokenUsed($tokenId);
-                // Clear reset session vars
                 unset($_SESSION['reset_token_id'], $_SESSION['reset_user_table'],
                       $_SESSION['reset_user_id'], $_SESSION['reset_email'], $_SESSION['reset_role']);
+                error_log("Password updated successfully!");
                 $message = '✅ Password changed successfully. Please log in.';
                 $msgType = 'success';
                 $action  = 'login';
             }
         }
+        error_log("=== RESET PASSWORD END ===");
     }
 }
 
-// Fetch courses for student registration form
 $courses = [];
 if ($action === 'register') {
     $cRes = $conn->query("SELECT course_id, course_name FROM courses WHERE deleted = 0 ORDER BY course_name");
@@ -323,8 +352,7 @@ if ($action === 'register') {
             margin-bottom: 7px;
         }
 
-        input[type="text"], input[type="email"], input[type="password"],
-        select {
+        input[type="text"], input[type="email"], input[type="password"], select {
             width: 100%;
             padding: 11px 14px;
             border: 2px solid #dde3eb;
@@ -434,7 +462,7 @@ if ($action === 'register') {
             <div class="alert alert-<?= $msgType ?>"><?= htmlspecialchars($message) ?></div>
         <?php endif; ?>
 
-        <?php /* ── LOGIN FORM ── */ if ($action === 'login'): ?>
+        <?php if ($action === 'login'): ?>
         <form method="POST">
             <input type="hidden" name="action" value="login">
 
@@ -478,7 +506,7 @@ if ($action === 'register') {
             </div>
         </form>
 
-        <?php /* ── STUDENT REGISTER ── */ elseif ($action === 'register'): ?>
+        <?php elseif ($action === 'register'): ?>
         <form method="POST">
             <input type="hidden" name="action" value="register">
 
@@ -558,7 +586,7 @@ if ($action === 'register') {
             </div>
         </form>
 
-        <?php /* ── FORGOT PASSWORD ── */ elseif ($action === 'forgot'): ?>
+        <?php elseif ($action === 'forgot'): ?>
         <form method="POST">
             <input type="hidden" name="action" value="forgot">
 
@@ -588,7 +616,7 @@ if ($action === 'register') {
             </div>
         </form>
 
-        <?php /* ── VERIFY CODE ── */ elseif ($action === 'verify_code'): ?>
+        <?php elseif ($action === 'verify_code'): ?>
         <form method="POST">
             <input type="hidden" name="action" value="verify_code">
 
@@ -612,7 +640,7 @@ if ($action === 'register') {
             </div>
         </form>
 
-        <?php /* ── RESET PASSWORD ── */ elseif ($action === 'reset'): ?>
+        <?php elseif ($action === 'reset'): ?>
         <form method="POST">
             <input type="hidden" name="action" value="reset">
 
@@ -639,8 +667,8 @@ if ($action === 'register') {
         </form>
         <?php endif; ?>
 
-    </div><!-- /.card-body -->
-</div><!-- /.card -->
+    </div>
+</div>
 
 <script>
     function selectRole(role) {
@@ -651,10 +679,14 @@ if ($action === 'register') {
 
     function togglePw(id, btn) {
         const f = document.getElementById(id);
-        if (f.type === 'password') { f.type = 'text';     btn.textContent = 'Hide'; }
-        else                        { f.type = 'password'; btn.textContent = 'Show'; }
+        if (f.type === 'password') {
+            f.type = 'text';
+            btn.textContent = 'Hide';
+        } else {
+            f.type = 'password';
+            btn.textContent = 'Show';
+        }
     }
 </script>
 </body>
 </html>
-
