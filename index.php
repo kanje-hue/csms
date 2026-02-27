@@ -255,13 +255,12 @@ if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])){
             
             if($result->num_rows > 0){
                 $user = $result->fetch_assoc();
-                $reset_data = $security->generatePasswordResetToken($user[$id_field], $user_type, $email);
+                $code = $security->generateVerificationCode($table, $user[$id_field], $email);
                 
                 // Send email
-                $security->sendPasswordResetEmail($email, $user['fullname'], $reset_data['code']);
+                $security->sendPasswordResetEmail($email, $user['fullname'], $code);
                 
-                // Store token in session for verification page
-                $_SESSION['reset_token'] = $reset_data['token'];
+                // Store type in session for verification page
                 $_SESSION['reset_type'] = $user_type;
                 
                 $message = "✅ Verification code sent to your email. Please check your inbox.";

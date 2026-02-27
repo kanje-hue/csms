@@ -175,7 +175,7 @@ class SecurityManager {
      * @param string $email
      * @return string|false  The verification code (6-digit) or false on failure
      */
-    public function generatePasswordResetToken($table, $userId, $email) {
+    public function generateVerificationCode($table, $userId, $email) {
         $allowedTables = ['admins', 'teachers', 'students'];
         if (!in_array($table, $allowedTables)) {
             return false;
@@ -186,7 +186,7 @@ class SecurityManager {
         $now        = date('Y-m-d H:i:s');
         $expiresAt  = date('Y-m-d H:i:s', time() + self::RESET_TOKEN_EXPIRY);
 
-        error_log("=== DEBUG generatePasswordResetToken ===");
+        error_log("=== DEBUG generateVerificationCode ===");
         error_log("  table: '$table'");
         error_log("  userId: $userId");
         error_log("  email: '$email'");

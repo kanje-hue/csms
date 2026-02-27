@@ -149,7 +149,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $stmt->close();
 
             if ($user) {
-                $code = $security->generatePasswordResetToken($table, $user[$idCol], $email);
+                $code = $security->generateVerificationCode($table, $user[$idCol], $email);
                 if ($code) {
                     $subject = 'CSMS Password Reset Code';
                     $body    = "<p>Your password reset verification code is: <strong>$code</strong></p>"
