@@ -1,98 +1,53 @@
 <?php
 /**
- * SecurityManager - Handles password management, login attempt tracking,
- * account lockout, password reset tokens, and login audit logging.
+ * config/security.php
+ * Improved SecurityManager with database time fix
  */
 class SecurityManager {
     private $conn;
-
-    // Security constants
-    const MAX_LOGIN_ATTEMPTS = 5;
-    const LOCKOUT_DURATION   = 1800; // 30 minutes in seconds
-    const PASSWORD_HISTORY   = 5;    // Last 5 passwords
-    const RESET_TOKEN_EXPIRY = 3600; // 1 hour
+    private static $tableMap = [
+        'admins'   => ['table' => 'admins',   'pk' => 'admin_id'],
+        'teachers' => ['table' => 'teachers', 'pk' => 'teacher_id'],
+        'students' => ['table' => 'students', 'pk' => 'student_id'],
+    ];
 
     public function __construct($conn) {
         $this->conn = $conn;
     }
 
-    /**
-     * Validate password strength.
-     * Requirements: 8+ chars, uppercase, lowercase, digit, special char.
-     */
     public function validatePasswordStrength($password) {
         if (strlen($password) < 8) {
-            return ['valid' => false, 'message' => 'Password must be at least 8 characters long.'];
+            return ['valid' => false, 'message' => 'Password must be at least 8 characters'];
         }
         if (!preg_match('/[A-Z]/', $password)) {
-            return ['valid' => false, 'message' => 'Password must contain at least one uppercase letter.'];
+            return ['valid' => false, 'message' => 'Password must contain at least one uppercase letter'];
         }
         if (!preg_match('/[a-z]/', $password)) {
-            return ['valid' => false, 'message' => 'Password must contain at least one lowercase letter.'];
+            return ['valid' => false, 'message' => 'Password must contain at least one lowercase letter'];
         }
         if (!preg_match('/[0-9]/', $password)) {
-            return ['valid' => false, 'message' => 'Password must contain at least one number.'];
+            return ['valid' => false, 'message' => 'Password must contain at least one number'];
         }
-        if (!preg_match('/[\W_]/', $password)) {
-            return ['valid' => false, 'message' => 'Password must contain at least one special character.'];
+        if (!preg_match('/[^A-Za-z0-9]/', $password)) {
+            return ['valid' => false, 'message' => 'Password must contain at least one special character'];
         }
-        return ['valid' => true, 'message' => 'Password is strong.'];
+        return ['valid' => true, 'message' => 'Password is strong'];
     }
 
-    /**
-     * Hash a password using bcrypt.
-     */
     public function hashPassword($password) {
         return password_hash($password, PASSWORD_BCRYPT);
     }
 
-    /**
-     * Verify a password against a hash.
-     */
     public function verifyPassword($password, $hash) {
         return password_verify($password, $hash);
     }
 
-    /**
-     * Generate a secure random password.
-     */
-    public function generateSecurePassword($length = 12) {
-        $upper   = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-        $lower   = 'abcdefghijklmnopqrstuvwxyz';
-        $digits  = '0123456789';
-        $special = '!@#$%^&*()_+-=[]{}';
-        $all     = $upper . $lower . $digits . $special;
-
-        $password  = $upper[random_int(0, strlen($upper) - 1)];
-        $password .= $lower[random_int(0, strlen($lower) - 1)];
-        $password .= $digits[random_int(0, strlen($digits) - 1)];
-        $password .= $special[random_int(0, strlen($special) - 1)];
-
-        for ($i = 4; $i < $length; $i++) {
-            $password .= $all[random_int(0, strlen($all) - 1)];
-        }
-
-        return str_shuffle($password);
-    }
-
-    /**
-     * Check if account is currently locked out.
-     *
-     * @param string $table  admins | teachers | students
-     * @param int    $userId
-     * @return bool
-     */
-    public function isAccountLocked($table, $userId) {
-        $allowedTables = ['admins', 'teachers', 'students'];
-        if (!in_array($table, $allowedTables)) {
-            return false;
-        }
-
-        $idCol = $this->getIdColumn($table);
-        $stmt  = $this->conn->prepare(
-            "SELECT locked_until FROM `$table` WHERE `$idCol` = ?"
+    public function isAccountLocked($user_type, $user_id) {
+        $meta = $this->getMeta($user_type);
+        $stmt = $this->conn->prepare(
+            "SELECT locked_until FROM `{$meta['table']}` WHERE `{$meta['pk']}` = ? LIMIT 1"
         );
-        $stmt->bind_param("i", $userId);
+        $stmt->bind_param('i', $user_id);
         $stmt->execute();
         $row = $stmt->get_result()->fetch_assoc();
         $stmt->close();
@@ -103,195 +58,254 @@ class SecurityManager {
         return false;
     }
 
-    /**
-     * Record a failed login attempt; lock account after MAX_LOGIN_ATTEMPTS.
-     *
-     * @param string $table
-     * @param int    $userId
-     */
-    public function recordFailedLogin($table, $userId) {
-        $allowedTables = ['admins', 'teachers', 'students'];
-        if (!in_array($table, $allowedTables)) {
-            return;
-        }
-
-        $idCol = $this->getIdColumn($table);
-
-        // Increment counter
+    public function getLockedUntil($user_type, $user_id) {
+        $meta = $this->getMeta($user_type);
         $stmt = $this->conn->prepare(
-            "UPDATE `$table` SET failed_login_attempts = failed_login_attempts + 1 WHERE `$idCol` = ?"
+            "SELECT locked_until FROM `{$meta['table']}` WHERE `{$meta['pk']}` = ? LIMIT 1"
         );
-        $stmt->bind_param("i", $userId);
-        $stmt->execute();
-        $stmt->close();
-
-        // Check if we hit the threshold
-        $stmt = $this->conn->prepare(
-            "SELECT failed_login_attempts FROM `$table` WHERE `$idCol` = ?"
-        );
-        $stmt->bind_param("i", $userId);
+        $stmt->bind_param('i', $user_id);
         $stmt->execute();
         $row = $stmt->get_result()->fetch_assoc();
         $stmt->close();
 
-        if ($row && $row['failed_login_attempts'] >= self::MAX_LOGIN_ATTEMPTS) {
-            $lockedUntil = date('Y-m-d H:i:s', time() + self::LOCKOUT_DURATION);
+        return $row['locked_until'] ?? null;
+    }
+
+    public function getLockoutMinutes($user_type, $user_id) {
+        $until = $this->getLockedUntil($user_type, $user_id);
+        if (!$until) return 0;
+        
+        $remaining = strtotime($until) - time();
+        return max(0, ceil($remaining / 60));
+    }
+
+    public function recordFailedAttempt($user_type, $user_id) {
+        $meta = $this->getMeta($user_type);
+        
+        $stmt = $this->conn->prepare(
+            "UPDATE `{$meta['table']}` SET failed_login_attempts = failed_login_attempts + 1 WHERE `{$meta['pk']}` = ?"
+        );
+        $stmt->bind_param('i', $user_id);
+        $stmt->execute();
+        $stmt->close();
+
+        $stmt = $this->conn->prepare(
+            "SELECT failed_login_attempts FROM `{$meta['table']}` WHERE `{$meta['pk']}` = ?"
+        );
+        $stmt->bind_param('i', $user_id);
+        $stmt->execute();
+        $row = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+
+        $attempts = (int)($row['failed_login_attempts'] ?? 0);
+
+        if ($attempts >= 5) {
+            $locked_until = date('Y-m-d H:i:s', time() + 1800);
             $stmt = $this->conn->prepare(
-                "UPDATE `$table` SET locked_until = ? WHERE `$idCol` = ?"
+                "UPDATE `{$meta['table']}` SET locked_until = ? WHERE `{$meta['pk']}` = ?"
             );
-            $stmt->bind_param("si", $lockedUntil, $userId);
+            $stmt->bind_param('si', $locked_until, $user_id);
             $stmt->execute();
             $stmt->close();
         }
+
+        return $attempts;
     }
 
-    /**
-     * Reset failed login counter and lockout after successful login.
-     *
-     * @param string $table
-     * @param int    $userId
-     */
-    public function resetLoginAttempts($table, $userId) {
-        $allowedTables = ['admins', 'teachers', 'students'];
-        if (!in_array($table, $allowedTables)) {
-            return;
-        }
-
-        $idCol = $this->getIdColumn($table);
-        $stmt  = $this->conn->prepare(
-            "UPDATE `$table` SET failed_login_attempts = 0, locked_until = NULL WHERE `$idCol` = ?"
+    public function resetFailedAttempts($user_type, $user_id) {
+        $meta = $this->getMeta($user_type);
+        $stmt = $this->conn->prepare(
+            "UPDATE `{$meta['table']}` SET failed_login_attempts = 0, locked_until = NULL WHERE `{$meta['pk']}` = ?"
         );
-        $stmt->bind_param("i", $userId);
+        $stmt->bind_param('i', $user_id);
         $stmt->execute();
         $stmt->close();
     }
 
     /**
-     * Generate a password reset token and store it in the database.
-     * FIXED: Uses PHP date functions instead of MySQL DATE_ADD, proper bind_param
-     *
-     * @param string $table
-     * @param int    $userId
-     * @param string $email
-     * @return string|false  The verification code (6-digit) or false on failure
+     * Generate verification code using database time
      */
-    public function generatePasswordResetToken($table, $userId, $email) {
-        $allowedTables = ['admins', 'teachers', 'students'];
-        if (!in_array($table, $allowedTables)) {
-            return false;
-        }
-
-        $token      = bin2hex(random_bytes(32));
-        $code       = str_pad(random_int(0, 999999), 6, '0', STR_PAD_LEFT);
-        $now        = date('Y-m-d H:i:s');
-        $expiresAt  = date('Y-m-d H:i:s', time() + self::RESET_TOKEN_EXPIRY);
-
-        error_log("=== DEBUG generatePasswordResetToken ===");
-        error_log("  table: '$table'");
-        error_log("  userId: $userId");
-        error_log("  email: '$email'");
-        error_log("  code: '$code'");
-        error_log("  now: '$now'");
-        error_log("  expiresAt: '$expiresAt'");
-
-        // Invalidate previous tokens for this user/table
-        $del = $this->conn->prepare(
-            "DELETE FROM password_reset_tokens WHERE user_type = ? AND user_id = ?"
-        );
-        $del->bind_param("si", $table, $userId);
-        $del->execute();
-        $del->close();
-
-        // FIXED: Use explicit date values instead of SQL functions
-        // Parameters: user_type, user_id, email, token, verification_code, created_at, expires_at
-        $ins = $this->conn->prepare(
-            "INSERT INTO password_reset_tokens (user_type, user_id, email, token, verification_code, created_at, expires_at, is_used)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 0)"
-        );
-        
-        // Bind parameters: s=string, i=integer, s=string, s=string, s=string, s=string, s=string
-        $ins->bind_param("sisisss", $table, $userId, $email, $token, $code, $now, $expiresAt);
-        
-        error_log("About to execute INSERT with bind_param: sisisss");
-        
-        if ($ins->execute()) {
-            error_log("INSERT successful!");
-            $ins->close();
-            return $code;
-        } else {
-            error_log("INSERT failed: " . $ins->error);
-            $ins->close();
-            return false;
+    public function generateVerificationCode($user_type, $user_id, $email) {
+        try {
+            // Validate inputs
+            if (!in_array($user_type, ['admins', 'teachers', 'students'])) {
+                throw new Exception("Invalid user type: $user_type");
+            }
+            
+            if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                throw new Exception("Invalid email format");
+            }
+            
+            // Start transaction
+            $this->conn->begin_transaction();
+            
+            // Delete old unused tokens for this user
+            $cleanup = $this->conn->prepare(
+                "DELETE FROM password_reset_tokens 
+                 WHERE user_type = ? AND user_id = ?"
+            );
+            $cleanup->bind_param('si', $user_type, $user_id);
+            $cleanup->execute();
+            $cleanup->close();
+            
+            // Generate secure values
+            $code = sprintf("%06d", random_int(0, 999999));
+            $token = bin2hex(random_bytes(32));
+            
+            // Get database current time
+            $time_result = $this->conn->query("SELECT NOW() as db_now")->fetch_assoc();
+            $db_now = $time_result['db_now'];
+            
+            // Calculate expiry using database time
+            $expires_at = date('Y-m-d H:i:s', strtotime($db_now . ' +1 hour'));
+            
+            // Log time info for debugging
+            error_log("🕐 Time Info - PHP: " . date('Y-m-d H:i:s') . ", DB: $db_now");
+            error_log("   Token expires at: $expires_at");
+            
+            // Insert new token
+            $sql = "INSERT INTO password_reset_tokens 
+                    (user_type, user_id, email, token, verification_code, created_at, expires_at) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?)";
+            
+            $stmt = $this->conn->prepare($sql);
+            if (!$stmt) {
+                throw new Exception("Prepare failed: " . $this->conn->error);
+            }
+            
+            $stmt->bind_param('sisssss', 
+                $user_type, $user_id, $email, $token, $code, $db_now, $expires_at
+            );
+            
+            if (!$stmt->execute()) {
+                throw new Exception("Execute failed: " . $stmt->error);
+            }
+            
+            $this->conn->commit();
+            $stmt->close();
+            
+            error_log("✅ Password reset code generated for $email: $code");
+            
+            return [
+                'code' => $code,
+                'token' => $token,
+                'expires_at' => $expires_at
+            ];
+            
+        } catch (Exception $e) {
+            $this->conn->rollback();
+            error_log("❌ generateVerificationCode error: " . $e->getMessage());
+            return null;
         }
     }
 
     /**
-     * Verify a password reset code.
-     *
-     * @param string $email
-     * @param string $code
-     * @return array|false  Row from password_reset_tokens or false
+     * Verify code using database time
      */
-    public function verifyResetCode($email, $code) {
-        error_log("=== DEBUG verifyResetCode ===");
-        error_log("  email: '$email'");
-        error_log("  code: '$code'");
+    public function verifyCode($email, $code, $user_type) {
+        try {
+            // Clean inputs
+            $email = trim($email);
+            $code = trim(preg_replace('/[^0-9]/', '', $code));
+            $user_type = trim($user_type);
+            
+            error_log("🔍 Verifying code for: $email");
+            
+            if (strlen($code) !== 6) {
+                return ['valid' => false, 'message' => 'Code must be 6 digits'];
+            }
+            
+            // Get current database time for comparison
+            $db_time = $this->conn->query("SELECT NOW() as db_now")->fetch_assoc()['db_now'];
+            error_log("   Current DB time: $db_time");
+            
+            // Get the latest valid token using database time
+            $sql = "SELECT * FROM password_reset_tokens 
+                    WHERE email = ? AND user_type = ? 
+                    AND is_used = 0 AND expires_at > ? 
+                    ORDER BY id DESC LIMIT 1";
+            
+            $stmt = $this->conn->prepare($sql);
+            $stmt->bind_param('sss', $email, $user_type, $db_time);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            $token_data = $result->fetch_assoc();
+            $stmt->close();
+            
+            if (!$token_data) {
+                error_log("❌ No valid token found for $email");
+                return ['valid' => false, 'message' => 'No valid reset request found. Please request a new code.'];
+            }
+            
+            error_log("✅ Token found: ID={$token_data['id']}, stored_code={$token_data['verification_code']}");
+            
+            // Check attempts
+            if ($token_data['code_attempts'] >= 5) {
+                return ['valid' => false, 'message' => 'Too many failed attempts. Please request a new code.'];
+            }
+            
+            // Increment attempts
+            $update = $this->conn->prepare(
+                "UPDATE password_reset_tokens SET code_attempts = code_attempts + 1 WHERE id = ?"
+            );
+            $update->bind_param('i', $token_data['id']);
+            $update->execute();
+            $update->close();
+            
+            // Verify code
+            if (trim($token_data['verification_code']) !== trim($code)) {
+                error_log("❌ Code mismatch");
+                return ['valid' => false, 'message' => 'Invalid verification code.'];
+            }
+            
+            error_log("✅ Code verified successfully");
+            
+            return [
+                'valid' => true,
+                'token' => $token_data['token'],
+                'user_id' => (int)$token_data['user_id'],
+                'user_type' => $token_data['user_type']
+            ];
+            
+        } catch (Exception $e) {
+            error_log("❌ verifyCode error: " . $e->getMessage());
+            return ['valid' => false, 'message' => 'An error occurred. Please try again.'];
+        }
+    }
+
+    public function verifyResetToken($token) {
+        // Get database time
+        $db_time = $this->conn->query("SELECT NOW() as db_now")->fetch_assoc()['db_now'];
         
         $stmt = $this->conn->prepare(
-            "SELECT id, user_type, user_id, email, token, verification_code, expires_at, is_used 
-             FROM password_reset_tokens
-             WHERE email = ? AND verification_code = ? AND expires_at > NOW() AND is_used = 0"
+            "SELECT * FROM password_reset_tokens 
+             WHERE token = ? AND is_used = 0 AND expires_at > ? 
+             LIMIT 1"
         );
-        $stmt->bind_param("ss", $email, $code);
+        $stmt->bind_param('ss', $token, $db_time);
         $stmt->execute();
-        $row = $stmt->get_result()->fetch_assoc();
+        $result = $stmt->get_result();
+        $data = $result->fetch_assoc();
         $stmt->close();
         
-        if ($row) {
-            error_log("Found token record:");
-            error_log("  id: {$row['id']}");
-            error_log("  user_type: '{$row['user_type']}'");
-            error_log("  user_id: {$row['user_id']}");
-        } else {
-            error_log("No token found");
-        }
-        
-        return $row ?: false;
+        return $data;
     }
 
-    /**
-     * Mark a reset token as used.
-     *
-     * @param int $tokenId
-     */
-    public function markTokenUsed($tokenId) {
+    public function invalidateToken($token) {
         $stmt = $this->conn->prepare(
-            "UPDATE password_reset_tokens SET is_used = 1 WHERE id = ?"
+            "UPDATE password_reset_tokens SET is_used = 1 WHERE token = ?"
         );
-        $stmt->bind_param("i", $tokenId);
+        $stmt->bind_param('s', $token);
         $stmt->execute();
         $stmt->close();
     }
 
-    /**
-     * Check whether a new password was used recently (last PASSWORD_HISTORY passwords).
-     *
-     * @param string $table
-     * @param int    $userId
-     * @param string $newPassword  Plain-text new password
-     * @return bool  true if reused
-     */
-    public function isPasswordReused($table, $userId, $newPassword) {
-        $allowedTables = ['admins', 'teachers', 'students'];
-        if (!in_array($table, $allowedTables)) {
-            return false;
-        }
-
-        $idCol = $this->getIdColumn($table);
-        $stmt  = $this->conn->prepare(
-            "SELECT password_history FROM `$table` WHERE `$idCol` = ?"
+    public function checkPasswordHistory($user_type, $user_id, $new_password) {
+        $meta = $this->getMeta($user_type);
+        $stmt = $this->conn->prepare(
+            "SELECT password_history FROM `{$meta['table']}` WHERE `{$meta['pk']}` = ?"
         );
-        $stmt->bind_param("i", $userId);
+        $stmt->bind_param('i', $user_id);
         $stmt->execute();
         $row = $stmt->get_result()->fetch_assoc();
         $stmt->close();
@@ -299,7 +313,7 @@ class SecurityManager {
         if ($row && $row['password_history']) {
             $history = json_decode($row['password_history'], true) ?? [];
             foreach ($history as $oldHash) {
-                if (password_verify($newPassword, $oldHash)) {
+                if (password_verify($new_password, $oldHash)) {
                     return true;
                 }
             }
@@ -307,100 +321,75 @@ class SecurityManager {
         return false;
     }
 
-    /**
-     * Update a user's password and maintain the history list.
-     *
-     * @param string $table
-     * @param int    $userId
-     * @param string $newPassword  Plain-text new password
-     * @param bool   $forceChange  Whether to clear the force_password_change flag
-     */
-    public function updatePassword($table, $userId, $newPassword, $forceChange = false) {
-        $allowedTables = ['admins', 'teachers', 'students'];
-        if (!in_array($table, $allowedTables)) {
+    public function updatePassword($user_type, $user_id, $new_password) {
+        try {
+            $meta = self::$tableMap[$user_type] ?? null;
+            if (!$meta) {
+                throw new Exception("Invalid user type");
+            }
+            
+            $hash = $this->hashPassword($new_password);
+            $now = date('Y-m-d H:i:s');
+            
+            // Get current password and history
+            $stmt = $this->conn->prepare(
+                "SELECT password, password_history FROM `{$meta['table']}` 
+                 WHERE `{$meta['pk']}` = ? AND deleted = 0"
+            );
+            $stmt->bind_param('i', $user_id);
+            $stmt->execute();
+            $user = $stmt->get_result()->fetch_assoc();
+            $stmt->close();
+            
+            // Update password history
+            $history = [];
+            if ($user && $user['password']) {
+                $history[] = $user['password'];
+            }
+            if ($user && $user['password_history']) {
+                $old_history = json_decode($user['password_history'], true) ?? [];
+                $history = array_merge($history, $old_history);
+            }
+            
+            // Keep last 5 passwords
+            $history = array_slice($history, 0, 4);
+            $history_json = json_encode($history);
+            
+            // Update user
+            $update = $this->conn->prepare(
+                "UPDATE `{$meta['table']}` 
+                 SET password = ?, password_history = ?, 
+                     password_changed_at = ?, failed_login_attempts = 0,
+                     locked_until = NULL
+                 WHERE `{$meta['pk']}` = ?"
+            );
+            $update->bind_param('sssi', $hash, $history_json, $now, $user_id);
+            $result = $update->execute();
+            $update->close();
+            
+            return $result;
+            
+        } catch (Exception $e) {
+            error_log("updatePassword error: " . $e->getMessage());
             return false;
         }
-
-        $idCol   = $this->getIdColumn($table);
-        $newHash = $this->hashPassword($newPassword);
-
-        // Fetch current password + history
-        $stmt = $this->conn->prepare(
-            "SELECT password, password_history FROM `$table` WHERE `$idCol` = ?"
-        );
-        $stmt->bind_param("i", $userId);
-        $stmt->execute();
-        $row = $stmt->get_result()->fetch_assoc();
-        $stmt->close();
-
-        $history = [];
-        if ($row) {
-            if ($row['password']) {
-                $history[] = $row['password'];
-            }
-            $oldHistory = json_decode($row['password_history'] ?? '[]', true) ?? [];
-            $history    = array_merge($history, $oldHistory);
-        }
-
-        // Keep only last (PASSWORD_HISTORY - 1) so the current becomes history[0]
-        $history = array_slice($history, 0, self::PASSWORD_HISTORY - 1);
-
-        $historyJson   = json_encode($history);
-        $now           = date('Y-m-d H:i:s');
-
-        if ($forceChange) {
-            $stmt = $this->conn->prepare(
-                "UPDATE `$table`
-                 SET password = ?, password_history = ?, password_changed_at = ?,
-                     force_password_change = 0
-                 WHERE `$idCol` = ?"
-            );
-            $stmt->bind_param("sssi", $newHash, $historyJson, $now, $userId);
-        } else {
-            $stmt = $this->conn->prepare(
-                "UPDATE `$table`
-                 SET password = ?, password_history = ?, password_changed_at = ?
-                 WHERE `$idCol` = ?"
-            );
-            $stmt->bind_param("sssi", $newHash, $historyJson, $now, $userId);
-        }
-
-        $result = $stmt->execute();
-        $stmt->close();
-        return $result;
     }
 
-    /**
-     * Write an entry to the login_audit table.
-     *
-     * @param string      $userType
-     * @param int|null    $userId
-     * @param string      $email
-     * @param string      $status    'success' | 'failed' | 'locked'
-     * @param string|null $ipAddress
-     */
-    public function logLoginAttempt($userType, $userId, $email, $status, $ipAddress = null) {
-        $ip   = $ipAddress ?? ($_SERVER['REMOTE_ADDR'] ?? 'unknown');
-        $ua   = $_SERVER['HTTP_USER_AGENT'] ?? null;
+    public function logLogin($user_type, $user_id, $email, $status) {
+        $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+        $ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
+
         $stmt = $this->conn->prepare(
-            "INSERT INTO login_audit (user_type, user_id, email, login_status, ip_address, user_agent)
-             VALUES (?, ?, ?, ?, ?, ?)"
+            "INSERT INTO login_audit (user_type, user_id, email, login_status, ip_address, user_agent, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, NOW())"
         );
-        $stmt->bind_param("sissss", $userType, $userId, $email, $status, $ip, $ua);
+        $stmt->bind_param('sissss', $user_type, $user_id, $email, $status, $ip, $ua);
         $stmt->execute();
         $stmt->close();
     }
 
-    /**
-     * Return the primary-key column name for a given table.
-     */
-    private function getIdColumn($table) {
-        $map = [
-            'admins'   => 'admin_id',
-            'teachers' => 'teacher_id',
-            'students' => 'student_id',
-        ];
-        return $map[$table] ?? 'id';
+    private function getMeta($user_type) {
+        return self::$tableMap[$user_type] ?? null;
     }
 }
 ?>

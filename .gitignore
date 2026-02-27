@@ -1,1 +1,18 @@
-/vendor/
+# Log files
+/logs/
+*.log
+
+# Development test files (optional - uncomment if you don't want to commit these)
+# public/test_*.php
+# view_logs.php
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+

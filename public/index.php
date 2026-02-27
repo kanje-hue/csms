@@ -1,270 +1,420 @@
 <?php
+/**
+ * index.php - Unified Login, Registration & Password Reset Hub
+ * Fixed column name issue - ROOT DIRECTORY VERSION
+ */
+
+// Enable error reporting for debugging
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
+require_once 'config/security.php';
+require_once 'config/db.php';
+require_once 'config/email_config.php';
+
 session_start();
-require_once '../config/db.php';
-require_once '../config/security.php';
-require_once '../config/email_config.php';
 
 $security = new SecurityManager($conn);
 
-$action  = $_GET['action'] ?? 'login';
-$message = '';
-$msgType = 'error';
+function h($v) { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
 
-function redirectByRole($role) {
-    $map = [
-        'admin'   => '../admin/manage_courses.php',
-        'teacher' => '../teacher/dashboard.php',
-        'student' => '../student/dashboard.php',
-    ];
-    header('Location: ' . ($map[$role] ?? '../'));
-    exit();
-}
+$view    = $_POST['view']    ?? $_GET['view']    ?? $_SESSION['reset_view'] ?? 'login';
+$role    = $_POST['role']    ?? $_GET['role']    ?? $_SESSION['reset_role'] ?? '';
+$message = '';
+$msg_type = 'error';
+
+if ($role) $_SESSION['reset_role'] = $role;
+else        $role = $_SESSION['reset_role'] ?? '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $postAction = $_POST['action'] ?? 'login';
 
-    if ($postAction === 'login') {
-        $email    = trim($_POST['email'] ?? '');
-        $password = $_POST['password'] ?? '';
-        $role     = $_POST['role'] ?? '';
+    $action = $_POST['action'] ?? '';
+    error_log("[CSMS Debug] action=$action view=$view role=$role");
 
-        $validRoles = ['admin' => 'admins', 'teacher' => 'teachers', 'student' => 'students'];
-        if (!$email || !$password || !isset($validRoles[$role])) {
-            $message = '❌ Please fill in all fields and select a role.';
+    // ── LOGIN ──────────────────────────────────────────────
+    if ($action === 'login') {
+        $email    = trim($_POST['email']    ?? '');
+        $password = trim($_POST['password'] ?? '');
+        $role     = trim($_POST['role']     ?? '');
+
+        // FIXED: Correct column names for each table
+        $roleMap = [
+            'admin'   => [
+                'table' => 'admins', 
+                'pk' => 'admin_id', 
+                'name_col' => 'name',     // admins uses 'name'
+                'redirect' => 'admin/manage_courses.php',  
+                'sess_prefix' => 'admin'
+            ],
+            'teacher' => [
+                'table' => 'teachers', 
+                'pk' => 'teacher_id', 
+                'name_col' => 'fullname', // teachers uses 'fullname'
+                'redirect' => 'teacher/dashboard.php',      
+                'sess_prefix' => 'teacher'
+            ],
+            'student' => [
+                'table' => 'students', 
+                'pk' => 'student_id', 
+                'name_col' => 'name',     // students uses 'name'
+                'redirect' => 'student/dashboard.php',      
+                'sess_prefix' => 'student'
+            ],
+        ];
+
+        if (!isset($roleMap[$role])) {
+            $_SESSION['flash_message'] = 'Please select a valid role.';
+            $_SESSION['flash_type'] = 'error';
+        } elseif (empty($email) || empty($password)) {
+            $_SESSION['flash_message'] = 'Please fill in all fields.';
+            $_SESSION['flash_type'] = 'error';
         } else {
-            $table = $validRoles[$role];
-            $idCol = ($role === 'admin') ? 'admin_id' : (($role === 'teacher') ? 'teacher_id' : 'student_id');
-            $nameCol = ($role === 'admin') ? 'name' : (($role === 'teacher') ? 'fullname' : 'name');
+            $meta      = $roleMap[$role];
+            $user_type = $role . 's';
 
-            $deletedCond = ($role === 'student') ? "AND deleted = 0 AND status = 'active'" : "AND deleted = 0";
+            // Debug: Log which table we're querying
+            error_log("Login attempt - Table: {$meta['table']}, Email: $email");
+
             $stmt = $conn->prepare(
-                "SELECT $idCol, $nameCol, email, password, force_password_change, locked_until, failed_login_attempts
-                 FROM `$table` WHERE email = ? $deletedCond"
+                "SELECT * FROM `{$meta['table']}` WHERE email = ? AND deleted = 0 LIMIT 1"
             );
-            $stmt->bind_param("s", $email);
-            $stmt->execute();
-            $user = $stmt->get_result()->fetch_assoc();
-            $stmt->close();
-
-            if (!$user) {
-                $security->logLoginAttempt($table, null, $email, 'failed');
-                $message = '❌ Invalid email or password.';
-            } elseif ($security->isAccountLocked($table, $user[$idCol])) {
-                $security->logLoginAttempt($table, $user[$idCol], $email, 'locked');
-                $lockedUntil = date('H:i', strtotime($user['locked_until']));
-                $message = "🔒 Account locked due to too many failed attempts. Try again after $lockedUntil.";
-            } elseif (!$security->verifyPassword($password, $user['password'])) {
-                $security->recordFailedLogin($table, $user[$idCol]);
-                $security->logLoginAttempt($table, $user[$idCol], $email, 'failed');
-                $remaining = max(0, SecurityManager::MAX_LOGIN_ATTEMPTS - ($user['failed_login_attempts'] + 1));
-                $message   = "❌ Invalid email or password. $remaining attempt(s) remaining before lockout.";
+            
+            if (!$stmt) {
+                error_log("Prepare failed: " . $conn->error);
+                $_SESSION['flash_message'] = 'Database error. Please try again.';
+                $_SESSION['flash_type'] = 'error';
             } else {
-                $security->resetLoginAttempts($table, $user[$idCol]);
-                $security->logLoginAttempt($table, $user[$idCol], $email, 'success');
+                $stmt->bind_param('s', $email);
+                $stmt->execute();
+                $user = $stmt->get_result()->fetch_assoc();
+                $stmt->close();
 
-                $_SESSION[$role . '_logged_in'] = true;
-                $_SESSION[$role . '_id']         = $user[$idCol];
-                $_SESSION[$role . '_name']       = $user[$nameCol];
-                $_SESSION['user_role']           = $role;
-                $_SESSION['csrf_token']          = bin2hex(random_bytes(32));
-
-                if ($user['force_password_change']) {
-                    $_SESSION['force_change_role']  = $role;
-                    $_SESSION['force_change_id']    = $user[$idCol];
-                    header('Location: change_password.php');
-                    exit();
-                }
-
-                redirectByRole($role);
-            }
-        }
-    }
-
-    elseif ($postAction === 'register') {
-        $regNumber = trim($_POST['reg_number'] ?? '');
-        $name      = trim($_POST['name'] ?? '');
-        $email     = trim($_POST['email'] ?? '');
-        $courseId  = (int)($_POST['course_id'] ?? 0);
-        $year      = (int)($_POST['year'] ?? 0);
-        $semester  = (int)($_POST['semester'] ?? 0);
-        $password  = $_POST['password'] ?? '';
-        $confirm   = $_POST['confirm_password'] ?? '';
-
-        $pwCheck = $security->validatePasswordStrength($password);
-
-        if (!$regNumber || !$name || !filter_var($email, FILTER_VALIDATE_EMAIL) || !$courseId || !$year || !$semester) {
-            $message = '❌ Please fill in all required fields.';
-            $action  = 'register';
-        } elseif ($password !== $confirm) {
-            $message = '❌ Passwords do not match.';
-            $action  = 'register';
-        } elseif (!$pwCheck['valid']) {
-            $message = '❌ ' . $pwCheck['message'];
-            $action  = 'register';
-        } else {
-            $chk = $conn->prepare("SELECT student_id FROM students WHERE email = ? AND deleted = 0");
-            $chk->bind_param("s", $email);
-            $chk->execute();
-            $exists = $chk->get_result()->num_rows > 0;
-            $chk->close();
-
-            if ($exists) {
-                $message = '❌ Email already registered.';
-                $action  = 'register';
-            } else {
-                $hash = $security->hashPassword($password);
-                $ins  = $conn->prepare(
-                    "INSERT INTO students (reg_number, name, email, password, course_id, year, semester, status, deleted, password_changed_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, NOW())"
-                );
-                $ins->bind_param("ssssiis", $regNumber, $name, $email, $hash, $courseId, $year, $semester);
-                if ($ins->execute()) {
-                    $message = '✅ Registration successful! Please wait for admin approval.';
-                    $msgType = 'success';
+                if (!$user) {
+                    $_SESSION['flash_message'] = '❌ Invalid email or password.';
+                    $_SESSION['flash_type'] = 'error';
+                    error_log("[CSMS Debug] Login failed: user not found for $role email=$email");
+                } elseif ($security->isAccountLocked($user_type, (int)$user[$meta['pk']])) {
+                    $mins    = $security->getLockoutMinutes($user_type, (int)$user[$meta['pk']]);
+                    $_SESSION['flash_message'] = "🔒 Account locked. Try again in $mins minute(s).";
+                    $_SESSION['flash_type'] = 'error';
+                } elseif (!$security->verifyPassword($password, $user['password'])) {
+                    $attempts  = $security->recordFailedAttempt($user_type, (int)$user[$meta['pk']]);
+                    $remaining = 5 - $attempts;
+                    if ($remaining <= 0) {
+                        $_SESSION['flash_message'] = '🔒 Account locked for 30 minutes due to too many failed attempts.';
+                    } else {
+                        $_SESSION['flash_message'] = "❌ Invalid email or password. $remaining attempt(s) remaining.";
+                    }
+                    $_SESSION['flash_type'] = 'error';
+                    $security->logLogin($user_type, (int)$user[$meta['pk']], $email, 'login_failure');
                 } else {
-                    $message = '❌ Registration failed. Please try again.';
+                    $security->resetFailedAttempts($user_type, (int)$user[$meta['pk']]);
+                    $security->logLogin($user_type, (int)$user[$meta['pk']], $email, 'login_success');
+
+                    $prefix = $meta['sess_prefix'];
+                    $_SESSION["{$prefix}_logged_in"] = true;
+                    $_SESSION["{$prefix}_id"]        = $user[$meta['pk']];
+                    $_SESSION["{$prefix}_name"]      = $user[$meta['name_col']];
+                    $_SESSION['csrf_token']           = bin2hex(random_bytes(32));
+
+                    unset($_SESSION['reset_view'], $_SESSION['reset_role'],
+                          $_SESSION['reset_email'], $_SESSION['reset_token']);
+
+                    header('Location: ' . $meta['redirect']);
+                    exit;
                 }
-                $ins->close();
-                $action = 'register';
             }
         }
-    }
+        $view = 'login';
 
-    elseif ($postAction === 'forgot') {
-        $email = trim($_POST['email'] ?? '');
-        $role  = $_POST['role'] ?? '';
+    // ── STUDENT REGISTRATION ──────────────────────────────
+    } elseif ($action === 'register') {
+        $reg_number = htmlspecialchars(trim($_POST['reg_number'] ?? ''), ENT_QUOTES, 'UTF-8');
+        $name       = htmlspecialchars(trim($_POST['name']       ?? ''), ENT_QUOTES, 'UTF-8');
+        $email      = filter_var(trim($_POST['email'] ?? ''), FILTER_VALIDATE_EMAIL);
+        $course_id  = filter_var($_POST['course_id'] ?? 0, FILTER_VALIDATE_INT);
+        $year       = filter_var($_POST['year']      ?? 0, FILTER_VALIDATE_INT);
+        $semester   = filter_var($_POST['semester']  ?? 0, FILTER_VALIDATE_INT);
+        $password   = $_POST['password']         ?? '';
+        $confirm    = $_POST['confirm_password'] ?? '';
 
-        $validRoles = ['admin' => 'admins', 'teacher' => 'teachers', 'student' => 'students'];
-        if (!filter_var($email, FILTER_VALIDATE_EMAIL) || !isset($validRoles[$role])) {
-            $message = '❌ Please provide a valid email and role.';
-            $action  = 'forgot';
+        if (!$reg_number || !$name || !$email || !$course_id || !$year || !$semester) {
+            $_SESSION['flash_message'] = 'Please fill in all required fields.';
+            $_SESSION['flash_type'] = 'error';
+        } elseif ($password !== $confirm) {
+            $_SESSION['flash_message'] = 'Passwords do not match.';
+            $_SESSION['flash_type'] = 'error';
         } else {
-            $table = $validRoles[$role];
-            $idCol = ($role === 'admin') ? 'admin_id' : (($role === 'teacher') ? 'teacher_id' : 'student_id');
+            $strength = $security->validatePasswordStrength($password);
+            if (!$strength['valid']) {
+                $_SESSION['flash_message'] = $strength['message'];
+                $_SESSION['flash_type'] = 'error';
+            } else {
+                $chk = $conn->prepare("SELECT student_id FROM students WHERE (email = ? OR reg_number = ?) AND deleted = 0 LIMIT 1");
+                $chk->bind_param('ss', $email, $reg_number);
+                $chk->execute();
+                if ($chk->get_result()->num_rows > 0) {
+                    $_SESSION['flash_message'] = 'Email or registration number already in use.';
+                    $_SESSION['flash_type'] = 'error';
+                } else {
+                    $hash = $security->hashPassword($password);
+                    $ins  = $conn->prepare(
+                        "INSERT INTO students (reg_number, name, email, password, course_id, year, semester, status, deleted, created_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, NOW())"
+                    );
+                    $ins->bind_param('ssssiis', $reg_number, $name, $email, $hash, $course_id, $year, $semester);
+                    if ($ins->execute()) {
+                        $_SESSION['flash_message'] = '✅ Registration successful! Please wait for admin approval.';
+                        $_SESSION['flash_type'] = 'success';
+                        $view = 'login';
+                    } else {
+                        $_SESSION['flash_message'] = 'Registration failed. Please try again.';
+                        $_SESSION['flash_type'] = 'error';
+                    }
+                    $ins->close();
+                }
+                $chk->close();
+            }
+        }
+        if ($_SESSION['flash_type'] !== 'success') $view = 'register';
 
-            $stmt = $conn->prepare("SELECT $idCol FROM `$table` WHERE email = ? AND deleted = 0");
-            $stmt->bind_param("s", $email);
+    // ── FORGOT PASSWORD – EMAIL SUBMISSION ────────────────
+    } elseif ($action === 'forgot_email') {
+        $email = trim($_POST['email'] ?? '');
+        $user_role = trim($_POST['role'] ?? '');
+        
+        // Clear old session data
+        unset($_SESSION['reset_email'], $_SESSION['reset_user_type'], 
+              $_SESSION['reset_token'], $_SESSION['reset_user_id']);
+        
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $_SESSION['flash_message'] = 'Please enter a valid email address.';
+            $_SESSION['flash_type'] = 'error';
+            $view = 'forgot';
+        } elseif (!in_array($user_role, ['admin', 'teacher', 'student'])) {
+            $_SESSION['flash_message'] = 'Please select a valid role.';
+            $_SESSION['flash_type'] = 'error';
+            $view = 'forgot';
+        } else {
+            $user_type = $user_role . 's';
+            $table_map = [
+                'admins' => 'admin_id',
+                'teachers' => 'teacher_id',
+                'students' => 'student_id'
+            ];
+            
+            // Check if user exists
+            $stmt = $conn->prepare(
+                "SELECT `{$table_map[$user_type]}` as user_id 
+                 FROM `{$user_type}` 
+                 WHERE email = ? AND deleted = 0 LIMIT 1"
+            );
+            $stmt->bind_param('s', $email);
             $stmt->execute();
             $user = $stmt->get_result()->fetch_assoc();
             $stmt->close();
-
+            
+            // Store email in session regardless
+            $_SESSION['reset_email'] = $email;
+            $_SESSION['reset_user_type'] = $user_type;
+            $_SESSION['reset_role'] = $user_role;
+            
             if ($user) {
-                $code = $security->generatePasswordResetToken($table, $user[$idCol], $email);
-                if ($code) {
-                    $subject = 'CSMS Password Reset Code';
-                    $body    = "<p>Your password reset verification code is: <strong>$code</strong></p>"
-                             . "<p>This code expires in 1 hour.</p>";
-                    send_email($email, ucfirst($role), $subject, $body);
+                // Generate verification code
+                $result = $security->generateVerificationCode(
+                    $user_type, 
+                    (int)$user['user_id'], 
+                    $email
+                );
+                
+                if ($result) {
+                    // Store in session
+                    $_SESSION['reset_user_id'] = (int)$user['user_id'];
+                    $_SESSION['reset_token_data'] = $result;
+                    
+                    // Create email content
+                    $email_content = "
+                    <!DOCTYPE html>
+                    <html>
+                    <head>
+                        <style>
+                            body { font-family: Arial, sans-serif; line-height: 1.6; }
+                            .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+                            .header { background: #16a085; color: white; padding: 20px; text-align: center; border-radius: 8px 8px 0 0; }
+                            .content { background: #f9f9f9; padding: 30px; border-radius: 0 0 8px 8px; }
+                            .code { 
+                                background: #fff; 
+                                padding: 20px; 
+                                text-align: center; 
+                                font-size: 48px; 
+                                font-weight: bold; 
+                                color: #16a085; 
+                                letter-spacing: 10px;
+                                border: 2px dashed #16a085;
+                                border-radius: 8px;
+                                margin: 20px 0;
+                                font-family: monospace;
+                            }
+                            .footer { text-align: center; color: #888; font-size: 12px; margin-top: 20px; }
+                        </style>
+                    </head>
+                    <body>
+                        <div class='container'>
+                            <div class='header'>
+                                <h1>CSMS Portal</h1>
+                                <p>College Student Management System</p>
+                            </div>
+                            <div class='content'>
+                                <h2 style='color: #333;'>Password Reset Request</h2>
+                                <p>Hello,</p>
+                                <p>You recently requested to reset your password. Use the verification code below to complete the process:</p>
+                                
+                                <div class='code'>{$result['code']}</div>
+                                
+                                <p><strong>This code will expire in 1 hour.</strong></p>
+                                <p>If you didn't request this, please ignore this email or contact support.</p>
+                                <hr style='border: 1px solid #eee;'>
+                                <p style='color: #888;'>This is an automated message, please do not reply.</p>
+                            </div>
+                            <div class='footer'>
+                                <p>&copy; " . date('Y') . " CSMS Portal. All rights reserved.</p>
+                            </div>
+                        </div>
+                    </body>
+                    </html>
+                    ";
+                    
+                    // Send email
+                    $email_sent = send_email(
+                        $email,
+                        $email,
+                        'Password Reset Code - CSMS',
+                        $email_content
+                    );
+                    
+                    // Show code on screen for development
+                    $_SESSION['flash_message'] = '🔑 YOUR VERIFICATION CODE IS: <strong style="font-size: 24px; letter-spacing: 3px;">' . $result['code'] . '</strong><br><small>Check your email or use this code directly.</small>';
+                    $_SESSION['flash_type'] = 'warning';
+                    
+                } else {
+                    $_SESSION['flash_message'] = '⚠️ System error. Please try again later.';
+                    $_SESSION['flash_type'] = 'error';
+                }
+            } else {
+                $_SESSION['flash_message'] = '✅ If the email exists, a code has been sent.';
+                $_SESSION['flash_type'] = 'success';
+            }
+            
+            $view = 'verify_code';
+        }
+
+    // ── FORGOT PASSWORD – CODE VERIFICATION ───────────────
+    } elseif ($action === 'verify_code') {
+        $code = trim(preg_replace('/[^0-9]/', '', $_POST['code'] ?? ''));
+        $email = $_SESSION['reset_email'] ?? '';
+        $user_type = $_SESSION['reset_user_type'] ?? '';
+        
+        if (empty($code) || strlen($code) !== 6) {
+            $_SESSION['flash_message'] = 'Please enter a valid 6-digit code.';
+            $_SESSION['flash_type'] = 'error';
+            $view = 'verify_code';
+        } elseif (empty($email) || empty($user_type)) {
+            $_SESSION['flash_message'] = 'Session expired. Please start over.';
+            $_SESSION['flash_type'] = 'error';
+            $view = 'forgot';
+            unset($_SESSION['reset_email'], $_SESSION['reset_user_type']);
+        } else {
+            $result = $security->verifyCode($email, $code, $user_type);
+            
+            if ($result['valid']) {
+                $_SESSION['reset_token'] = $result['token'];
+                $_SESSION['reset_user_id'] = $result['user_id'];
+                $_SESSION['reset_user_type'] = $result['user_type'];
+                $_SESSION['reset_verified'] = true;
+                $view = 'reset_password';
+                
+                unset($_SESSION['flash_message'], $_SESSION['flash_type']);
+            } else {
+                $_SESSION['flash_message'] = $result['message'];
+                $_SESSION['flash_type'] = 'error';
+                
+                if (strpos($result['message'], 'Too many') !== false) {
+                    unset($_SESSION['reset_email'], $_SESSION['reset_user_type']);
+                    $view = 'forgot';
+                } else {
+                    $view = 'verify_code';
                 }
             }
-            $message = '✅ If that email is registered, a verification code has been sent.';
-            $msgType = 'success';
-            $action  = 'verify_code';
-            $_SESSION['reset_email'] = $email;
-            $_SESSION['reset_role']  = $role;
         }
-    }
 
-    elseif ($postAction === 'verify_code') {
-        error_log("=== VERIFY CODE START ===");
-        
-        $email = $_SESSION['reset_email'] ?? '';
-        $code  = trim($_POST['code'] ?? '');
-
-        error_log("Email: $email, Code: $code");
-        
-        $row = $security->verifyResetCode($email, $code);
-        
-        error_log("Query result: " . print_r($row, true));
-        
-        if (!$row) {
-            error_log("Invalid or expired code");
-            $message = '❌ Invalid or expired verification code.';
-            $action  = 'verify_code';
-        } else {
-            error_log("Code verified! Setting session variables:");
-            error_log("  id: {$row['id']}");
-            error_log("  user_type: {$row['user_type']}");
-            error_log("  user_id: {$row['user_id']}");
-            
-            $_SESSION['reset_token_id']    = $row['id'];
-            $_SESSION['reset_user_table']  = $row['user_type'];
-            $_SESSION['reset_user_id']     = $row['user_id'];
-            $_SESSION['reset_email']       = $email;
-            
-            error_log("Session set. Current session: " . print_r($_SESSION, true));
-            
-            $message = '✅ Code verified! Please create your new password.';
-            $msgType = 'success';
-            $action  = 'reset';
-        }
-        error_log("=== VERIFY CODE END ===");
-    }
-
-    elseif ($postAction === 'reset') {
-        error_log("=== RESET PASSWORD START ===");
-        error_log("Current session at start of reset: " . print_r($_SESSION, true));
-        
-        $tokenId  = $_SESSION['reset_token_id']   ?? null;
-        $table    = $_SESSION['reset_user_table'] ?? null;
-        $userId   = $_SESSION['reset_user_id']    ?? null;
+    // ── FORGOT PASSWORD – NEW PASSWORD SUBMISSION ─────────
+    } elseif ($action === 'reset_password') {
+        $token = $_SESSION['reset_token'] ?? '';
+        $user_id = (int)($_SESSION['reset_user_id'] ?? 0);
+        $user_type = $_SESSION['reset_user_type'] ?? '';
+        $verified = $_SESSION['reset_verified'] ?? false;
         $password = $_POST['password'] ?? '';
-        $confirm  = $_POST['confirm_password'] ?? '';
-
-        error_log("tokenId: $tokenId, table: $table, userId: $userId");
+        $confirm = $_POST['confirm_password'] ?? '';
         
-        if (!$tokenId || !$table || !$userId) {
-            error_log("ERROR: Missing session variables!");
-            error_log("  tokenId is " . ($tokenId ? "SET to: $tokenId" : "NULL"));
-            error_log("  table is " . ($table ? "SET to: $table" : "NULL"));
-            error_log("  userId is " . ($userId ? "SET to: $userId" : "NULL"));
-            
-            $message = '❌ Invalid reset session. Please start over.';
-            $action  = 'forgot';
-            unset($_SESSION['reset_token_id'], $_SESSION['reset_user_table'],
-                  $_SESSION['reset_user_id'], $_SESSION['reset_email'], $_SESSION['reset_role']);
-        } elseif (!$password || !$confirm) {
-            error_log("ERROR: Missing password fields");
-            $message = '❌ Please fill in all password fields.';
-            $action  = 'reset';
-        } elseif ($password !== $confirm) {
-            error_log("ERROR: Passwords don't match");
-            $message = '❌ Passwords do not match.';
-            $action  = 'reset';
-        } else {
-            $pwCheck = $security->validatePasswordStrength($password);
-            if (!$pwCheck['valid']) {
-                error_log("ERROR: Password strength check failed: " . $pwCheck['message']);
-                $message = '❌ ' . $pwCheck['message'];
-                $action  = 'reset';
-            } elseif ($security->isPasswordReused($table, $userId, $password)) {
-                error_log("ERROR: Password reused");
-                $message = '❌ You cannot reuse one of your last ' . SecurityManager::PASSWORD_HISTORY . ' passwords.';
-                $action  = 'reset';
-            } else {
-                error_log("Updating password for table: $table, userId: $userId");
-                $security->updatePassword($table, $userId, $password, true);
-                $security->markTokenUsed($tokenId);
-                unset($_SESSION['reset_token_id'], $_SESSION['reset_user_table'],
-                      $_SESSION['reset_user_id'], $_SESSION['reset_email'], $_SESSION['reset_role']);
-                error_log("Password updated successfully!");
-                $message = '✅ Password changed successfully. Please log in.';
-                $msgType = 'success';
-                $action  = 'login';
+        if (empty($token) || !$user_id || empty($user_type) || !$verified) {
+            $_SESSION['flash_message'] = 'Session expired. Please start over.';
+            $_SESSION['flash_type'] = 'error';
+            $view = 'forgot';
+            unset($_SESSION['reset_token'], $_SESSION['reset_user_id'], 
+                  $_SESSION['reset_user_type'], $_SESSION['reset_verified']);
+        }
+        elseif (!$security->verifyResetToken($token)) {
+            $_SESSION['flash_message'] = 'Reset link has expired. Please start over.';
+            $_SESSION['flash_type'] = 'error';
+            $view = 'forgot';
+        }
+        elseif ($password !== $confirm) {
+            $_SESSION['flash_message'] = 'Passwords do not match.';
+            $_SESSION['flash_type'] = 'error';
+            $view = 'reset_password';
+        }
+        else {
+            $strength = $security->validatePasswordStrength($password);
+            if (!$strength['valid']) {
+                $_SESSION['flash_message'] = $strength['message'];
+                $_SESSION['flash_type'] = 'error';
+                $view = 'reset_password';
+            }
+            elseif ($security->checkPasswordHistory($user_type, $user_id, $password)) {
+                $_SESSION['flash_message'] = 'You cannot reuse a recent password.';
+                $_SESSION['flash_type'] = 'error';
+                $view = 'reset_password';
+            }
+            else {
+                if ($security->updatePassword($user_type, $user_id, $password)) {
+                    $security->invalidateToken($token);
+                    
+                    unset($_SESSION['reset_token'], $_SESSION['reset_user_id'],
+                          $_SESSION['reset_user_type'], $_SESSION['reset_email'],
+                          $_SESSION['reset_view'], $_SESSION['reset_role'],
+                          $_SESSION['reset_verified']);
+                    
+                    $_SESSION['flash_message'] = '✅ Password reset successfully! You can now log in.';
+                    $_SESSION['flash_type'] = 'success';
+                    $view = 'login';
+                } else {
+                    $_SESSION['flash_message'] = '❌ Failed to update password. Please try again.';
+                    $_SESSION['flash_type'] = 'error';
+                    $view = 'reset_password';
+                }
             }
         }
-        error_log("=== RESET PASSWORD END ===");
     }
+}
+
+if (in_array($view, ['verify_code', 'reset_password'])) {
+    $_SESSION['reset_view'] = $view;
 }
 
 $courses = [];
-if ($action === 'register') {
-    $cRes = $conn->query("SELECT course_id, course_name FROM courses WHERE deleted = 0 ORDER BY course_name");
-    if ($cRes) {
-        while ($c = $cRes->fetch_assoc()) {
-            $courses[] = $c;
-        }
-    }
+$cr = $conn->query("SELECT course_id, course_name FROM courses WHERE deleted = 0 ORDER BY course_name");
+if ($cr) {
+    while ($row = $cr->fetch_assoc()) $courses[] = $row;
 }
 ?>
 <!DOCTYPE html>
@@ -272,7 +422,7 @@ if ($action === 'register') {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CSMS – Login</title>
+    <title>CSMS – Login & Registration</title>
     <style>
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -287,204 +437,207 @@ if ($action === 'register') {
         }
 
         .card {
-            background: white;
+            background: #fff;
             width: 100%;
-            max-width: 480px;
+            max-width: 520px;
             border-radius: 16px;
-            box-shadow: 0 25px 50px rgba(0,0,0,0.4);
+            box-shadow: 0 20px 60px rgba(0,0,0,.4);
             overflow: hidden;
         }
 
         .card-header {
-            background: linear-gradient(135deg, #16213e, #0f3460);
-            color: white;
+            background: linear-gradient(135deg, #16a085, #117a65);
+            padding: 30px;
             text-align: center;
-            padding: 30px 20px 20px;
+            color: #fff;
         }
+        .card-header h1 { font-size: 22px; margin-bottom: 4px; }
+        .card-header p  { font-size: 13px; opacity: .85; }
 
-        .card-header h1 { font-size: 26px; margin-bottom: 6px; }
-        .card-header p  { font-size: 13px; opacity: 0.8; }
+        .card-body { padding: 30px; }
 
-        .tab-nav {
-            display: flex;
-            background: #f0f4f8;
-            border-bottom: 1px solid #dde3eb;
-        }
-
-        .tab-btn {
+        .role-buttons { display: flex; gap: 10px; margin-bottom: 24px; }
+        .role-btn {
             flex: 1;
-            padding: 13px 8px;
-            border: none;
-            background: none;
+            padding: 10px 6px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            background: #fff;
+            color: #555;
+            font-size: 13px;
+            font-weight: 600;
             cursor: pointer;
+            text-align: center;
+            transition: all .25s;
+            text-decoration: none;
+            display: block;
+        }
+        .role-btn:hover, .role-btn.active {
+            border-color: #16a085;
+            background: #16a085;
+            color: #fff;
+        }
+
+        .form-group { margin-bottom: 18px; }
+        .form-group label {
+            display: block;
             font-size: 12px;
             font-weight: 600;
-            color: #7f8c8d;
-            transition: all 0.2s;
+            color: #444;
+            margin-bottom: 6px;
+            text-transform: uppercase;
+            letter-spacing: .5px;
+        }
+        .form-group input,
+        .form-group select {
+            width: 100%;
+            padding: 11px 14px;
+            border: 2px solid #e8e8e8;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: border .25s;
+        }
+        .form-group input:focus,
+        .form-group select:focus {
+            outline: none;
+            border-color: #16a085;
+            box-shadow: 0 0 0 3px rgba(22,160,133,.12);
         }
 
-        .tab-btn.active {
-            background: white;
-            color: #0f3460;
-            border-bottom: 3px solid #0f3460;
-        }
+        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+        @media (max-width: 480px) { .form-row { grid-template-columns: 1fr; } }
 
-        .card-body { padding: 30px 25px; }
+        .btn-primary {
+            width: 100%;
+            padding: 13px;
+            background: linear-gradient(135deg, #16a085, #117a65);
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform .2s, box-shadow .2s;
+            margin-top: 6px;
+        }
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(22,160,133,.35);
+        }
 
         .alert {
             padding: 12px 15px;
             border-radius: 8px;
-            margin-bottom: 18px;
             font-size: 13px;
-            font-weight: 500;
+            margin-bottom: 20px;
+            border-left: 4px solid;
+        }
+        .alert-error   { background: #fdecea; color: #c0392b; border-color: #c0392b; }
+        .alert-success { background: #eafaf1; color: #1a7a4a; border-color: #27ae60; }
+        .alert-warning { 
+            background: #fff3cd; 
+            color: #856404; 
+            border-color: #ffc107;
+            font-size: 16px;
+            text-align: center;
+        }
+        .alert-warning strong {
+            font-size: 28px;
+            letter-spacing: 5px;
+            display: block;
+            margin: 10px 0;
         }
 
-        .alert-error   { background: #fdecea; color: #c0392b; border-left: 4px solid #c0392b; }
-        .alert-success { background: #d4edda; color: #155724; border-left: 4px solid #27ae60; }
-
-        .form-group { margin-bottom: 18px; }
-
-        label {
-            display: block;
+        .text-center { text-align: center; }
+        .mt-16 { margin-top: 16px; }
+        .link {
+            color: #16a085;
+            text-decoration: none;
             font-size: 13px;
             font-weight: 600;
-            color: #2c3e50;
-            margin-bottom: 7px;
         }
+        .link:hover { text-decoration: underline; }
 
-        input[type="text"], input[type="email"], input[type="password"], select {
-            width: 100%;
-            padding: 11px 14px;
-            border: 2px solid #dde3eb;
-            border-radius: 8px;
-            font-size: 14px;
-            transition: border-color 0.2s;
-            background: white;
-        }
-
-        input:focus, select:focus {
-            outline: none;
-            border-color: #0f3460;
-        }
-
-        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-
-        .role-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 10px;
-            margin-bottom: 20px;
-        }
-
-        .role-btn {
-            border: 2px solid #dde3eb;
-            border-radius: 10px;
-            padding: 14px 8px;
-            text-align: center;
-            cursor: pointer;
-            transition: all 0.2s;
-            background: white;
-        }
-
-        .role-btn:hover  { border-color: #0f3460; background: #f0f4f8; }
-        .role-btn.active { border-color: #0f3460; background: #e8eef8; }
-
-        .role-btn .icon { font-size: 24px; display: block; margin-bottom: 6px; }
-        .role-btn span  { font-size: 12px; font-weight: 600; color: #2c3e50; display: block; }
-
-        .btn {
-            width: 100%;
-            padding: 13px;
-            background: linear-gradient(135deg, #0f3460, #16213e);
-            color: white;
-            border: none;
-            border-radius: 8px;
-            font-weight: 700;
-            font-size: 14px;
-            cursor: pointer;
-            transition: opacity 0.2s;
+        .hint {
+            font-size: 11px;
+            color: #888;
             margin-top: 4px;
         }
 
-        .btn:hover { opacity: 0.9; }
+        .steps {
+            display: flex;
+            justify-content: center;
+            gap: 8px;
+            margin-bottom: 24px;
+        }
+        .step {
+            width: 28px; height: 28px;
+            border-radius: 50%;
+            border: 2px solid #ccc;
+            color: #ccc;
+            font-size: 12px;
+            font-weight: 700;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .step.active { border-color: #16a085; background: #16a085; color: #fff; }
+        .step.done   { border-color: #27ae60; background: #27ae60; color: #fff; }
+        .step-line { flex: 1; height: 2px; background: #e0e0e0; align-self: center; max-width: 40px; }
 
-        .link-row {
+        .code-display {
+            background: #f0f8ff;
+            padding: 15px;
+            border-radius: 8px;
             text-align: center;
-            margin-top: 16px;
-            font-size: 13px;
-            color: #7f8c8d;
+            margin: 10px 0;
+            border: 2px dashed #16a085;
         }
-
-        .link-row a { color: #0f3460; text-decoration: none; font-weight: 600; }
-        .link-row a:hover { text-decoration: underline; }
-
-        .pw-hint {
-            font-size: 11px;
-            color: #95a5a6;
-            margin-top: 5px;
-        }
-
-        .pw-wrap { position: relative; }
-
-        .pw-toggle {
-            position: absolute;
-            right: 12px; top: 50%;
-            transform: translateY(-50%);
-            background: none; border: none;
-            color: #7f8c8d; cursor: pointer;
-            font-size: 12px; font-weight: 600;
-        }
-
-        @media (max-width: 480px) {
-            .form-row { grid-template-columns: 1fr; }
+        .code-display .code {
+            font-size: 42px;
+            font-weight: bold;
+            color: #16a085;
+            letter-spacing: 8px;
+            font-family: monospace;
         }
     </style>
 </head>
 <body>
+
 <div class="card">
     <div class="card-header">
-        <h1>🎓 CSMS</h1>
-        <p>Course & Student Management System</p>
+        <h1>🎓 CSMS Portal</h1>
+        <p>College Student Management System</p>
     </div>
-
-    <?php if (!in_array($action, ['forgot', 'verify_code', 'reset', 'register'])): ?>
-    <div class="tab-nav">
-        <button class="tab-btn <?= $action === 'login' ? 'active' : '' ?>"
-                onclick="location.href='?action=login'">Login</button>
-        <button class="tab-btn <?= $action === 'register' ? 'active' : '' ?>"
-                onclick="location.href='?action=register'">Student Register</button>
-    </div>
-    <?php endif; ?>
 
     <div class="card-body">
-
-        <?php if ($message): ?>
-            <div class="alert alert-<?= $msgType ?>"><?= htmlspecialchars($message) ?></div>
+        <?php 
+        if (isset($_SESSION['flash_message'])): 
+        ?>
+        <div class="alert alert-<?= $_SESSION['flash_type'] ?? 'error' ?>">
+            <?= $_SESSION['flash_message'] ?>
+            <?php unset($_SESSION['flash_message'], $_SESSION['flash_type']); ?>
+        </div>
         <?php endif; ?>
 
-        <?php if ($action === 'login'): ?>
+        <?php if ($view === 'login'): ?>
+
+        <h2 style="font-size:18px;margin-bottom:18px;color:#1a1a2e">Sign In</h2>
+
         <form method="POST">
             <input type="hidden" name="action" value="login">
 
-            <p style="font-size:13px;color:#555;margin-bottom:16px;text-align:center;">
-                Select your role to continue
-            </p>
-
-            <div class="role-grid" id="roleGrid">
-                <div class="role-btn" id="role-admin" onclick="selectRole('admin')">
-                    <span class="icon">🏢</span>
-                    <span>Admin</span>
-                </div>
-                <div class="role-btn" id="role-teacher" onclick="selectRole('teacher')">
-                    <span class="icon">👨‍🏫</span>
-                    <span>Teacher</span>
-                </div>
-                <div class="role-btn" id="role-student" onclick="selectRole('student')">
-                    <span class="icon">👨‍🎓</span>
-                    <span>Student</span>
+            <div class="form-group">
+                <label>Select Role</label>
+                <div class="role-buttons">
+                    <?php foreach (['admin' => '🏢 Admin', 'teacher' => '👨‍🏫 Teacher', 'student' => '👨‍🎓 Student'] as $r => $label): ?>
+                    <label class="role-btn <?= $role === $r ? 'active' : '' ?>" style="cursor:pointer">
+                        <input type="radio" name="role" value="<?= $r ?>"
+                               <?= $role === $r ? 'checked' : '' ?>
+                               style="display:none" onchange="this.closest('form').querySelectorAll('.role-btn').forEach(b=>b.classList.remove('active'));this.parentElement.classList.add('active')">
+                        <?= $label ?>
+                    </label>
+                    <?php endforeach; ?>
                 </div>
             </div>
-            <input type="hidden" name="role" id="roleInput" value="">
 
             <div class="form-group">
                 <label>Email Address</label>
@@ -493,39 +646,42 @@ if ($action === 'register') {
 
             <div class="form-group">
                 <label>Password</label>
-                <div class="pw-wrap">
-                    <input type="password" name="password" id="loginPw" placeholder="Enter your password" required>
-                    <button type="button" class="pw-toggle" onclick="togglePw('loginPw',this)">Show</button>
-                </div>
+                <input type="password" name="password" placeholder="Enter your password" required>
             </div>
 
-            <button type="submit" class="btn">Sign In →</button>
-
-            <div class="link-row">
-                <a href="?action=forgot">Forgot password?</a>
-            </div>
+            <button type="submit" class="btn-primary">Sign In →</button>
         </form>
 
-        <?php elseif ($action === 'register'): ?>
+        <div class="text-center mt-16" style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px">
+            <a href="?view=forgot" class="link">Forgot password?</a>
+            <a href="?view=register" class="link">New student? Register</a>
+        </div>
+
+        <?php elseif ($view === 'register'): ?>
+
+        <h2 style="font-size:18px;margin-bottom:4px;color:#1a1a2e">Student Registration</h2>
+        <p style="font-size:12px;color:#888;margin-bottom:20px">Admin approval required after registration</p>
+
         <form method="POST">
             <input type="hidden" name="action" value="register">
 
-            <div class="form-group">
-                <label>Registration Number *</label>
-                <input type="text" name="reg_number" placeholder="e.g. STU001"
-                       value="<?= htmlspecialchars($_POST['reg_number'] ?? '') ?>" required>
-            </div>
-
-            <div class="form-group">
-                <label>Full Name *</label>
-                <input type="text" name="name" placeholder="Full name"
-                       value="<?= htmlspecialchars($_POST['name'] ?? '') ?>" required>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Registration Number *</label>
+                    <input type="text" name="reg_number" value="<?= h($_POST['reg_number'] ?? '') ?>"
+                           required placeholder="e.g. STU001">
+                </div>
+                <div class="form-group">
+                    <label>Full Name *</label>
+                    <input type="text" name="name" value="<?= h($_POST['name'] ?? '') ?>"
+                           required placeholder="John Doe">
+                </div>
             </div>
 
             <div class="form-group">
                 <label>Email Address *</label>
-                <input type="email" name="email" placeholder="student@example.com"
-                       value="<?= htmlspecialchars($_POST['email'] ?? '') ?>" required>
+                <input type="email" name="email" value="<?= h($_POST['email'] ?? '') ?>"
+                       required placeholder="john@example.com">
             </div>
 
             <div class="form-row">
@@ -534,22 +690,19 @@ if ($action === 'register') {
                     <select name="course_id" required>
                         <option value="">-- Select --</option>
                         <?php foreach ($courses as $c): ?>
-                            <option value="<?= $c['course_id'] ?>"
-                                <?= (isset($_POST['course_id']) && $_POST['course_id'] == $c['course_id']) ? 'selected' : '' ?>>
-                                <?= htmlspecialchars($c['course_name']) ?>
-                            </option>
+                        <option value="<?= (int)$c['course_id'] ?>"
+                            <?= (isset($_POST['course_id']) && $_POST['course_id'] == $c['course_id']) ? 'selected' : '' ?>>
+                            <?= h($c['course_name']) ?>
+                        </option>
                         <?php endforeach; ?>
                     </select>
                 </div>
                 <div class="form-group">
                     <label>Year *</label>
                     <select name="year" required>
-                        <option value="">-- Select --</option>
-                        <?php for ($y = 1; $y <= 4; $y++): ?>
-                            <option value="<?= $y ?>"
-                                <?= (isset($_POST['year']) && $_POST['year'] == $y) ? 'selected' : '' ?>>
-                                Year <?= $y ?>
-                            </option>
+                        <option value="">-- Year --</option>
+                        <?php for ($y = 1; $y <= 3; $y++): ?>
+                        <option value="<?= $y ?>" <?= (($_POST['year'] ?? '') == $y) ? 'selected' : '' ?>>Year <?= $y ?></option>
                         <?php endfor; ?>
                     </select>
                 </div>
@@ -558,135 +711,148 @@ if ($action === 'register') {
             <div class="form-group">
                 <label>Semester *</label>
                 <select name="semester" required>
-                    <option value="">-- Select --</option>
-                    <option value="1" <?= (isset($_POST['semester']) && $_POST['semester'] == 1) ? 'selected' : '' ?>>Semester 1</option>
-                    <option value="2" <?= (isset($_POST['semester']) && $_POST['semester'] == 2) ? 'selected' : '' ?>>Semester 2</option>
+                    <option value="">-- Semester --</option>
+                    <option value="1" <?= (($_POST['semester'] ?? '') == 1) ? 'selected' : '' ?>>Semester 1</option>
+                    <option value="2" <?= (($_POST['semester'] ?? '') == 2) ? 'selected' : '' ?>>Semester 2</option>
                 </select>
             </div>
 
             <div class="form-row">
                 <div class="form-group">
                     <label>Password *</label>
-                    <div class="pw-wrap">
-                        <input type="password" name="password" id="regPw" placeholder="Min 8 chars" required>
-                        <button type="button" class="pw-toggle" onclick="togglePw('regPw',this)">Show</button>
-                    </div>
+                    <input type="password" name="password" required placeholder="Min 8 chars">
+                    <div class="hint">8+ chars, upper, lower, number, special</div>
                 </div>
                 <div class="form-group">
                     <label>Confirm Password *</label>
-                    <input type="password" name="confirm_password" placeholder="Repeat password" required>
+                    <input type="password" name="confirm_password" required>
                 </div>
             </div>
-            <p class="pw-hint">Password must be 8+ chars with uppercase, lowercase, number &amp; special character.</p>
 
-            <button type="submit" class="btn" style="margin-top:14px;">Register →</button>
-
-            <div class="link-row">
-                Already have an account? <a href="?action=login">Login here</a>
-            </div>
+            <button type="submit" class="btn-primary">Register Account</button>
         </form>
 
-        <?php elseif ($action === 'forgot'): ?>
-        <form method="POST">
-            <input type="hidden" name="action" value="forgot">
+        <div class="text-center mt-16">
+            <a href="?view=login" class="link">← Back to Login</a>
+        </div>
 
-            <p style="font-size:13px;color:#555;margin-bottom:18px;">
-                Enter your email and select your role to receive a verification code.
-            </p>
+        <?php elseif ($view === 'forgot'): ?>
+
+        <div class="steps">
+            <div class="step active">1</div>
+            <div class="step-line"></div>
+            <div class="step">2</div>
+            <div class="step-line"></div>
+            <div class="step">3</div>
+        </div>
+
+        <h2 style="font-size:18px;margin-bottom:4px;color:#1a1a2e">Forgot Password</h2>
+        <p style="font-size:12px;color:#888;margin-bottom:20px">Enter your email to receive a 6-digit verification code</p>
+
+        <form method="POST">
+            <input type="hidden" name="action" value="forgot_email">
 
             <div class="form-group">
-                <label>Role</label>
+                <label>Account Type</label>
                 <select name="role" required>
                     <option value="">-- Select Role --</option>
-                    <option value="admin">Admin</option>
-                    <option value="teacher">Teacher</option>
-                    <option value="student">Student</option>
+                    <option value="admin" <?= ($role === 'admin') ? 'selected' : '' ?>>Admin</option>
+                    <option value="teacher" <?= ($role === 'teacher') ? 'selected' : '' ?>>Teacher</option>
+                    <option value="student" <?= ($role === 'student') ? 'selected' : '' ?>>Student</option>
                 </select>
             </div>
 
             <div class="form-group">
                 <label>Email Address</label>
-                <input type="email" name="email" placeholder="Your registered email" required>
+                <input type="email" name="email" required placeholder="your@email.com">
             </div>
 
-            <button type="submit" class="btn">Send Verification Code →</button>
-
-            <div class="link-row">
-                <a href="?action=login">← Back to Login</a>
-            </div>
+            <button type="submit" class="btn-primary">Send Verification Code</button>
         </form>
 
-        <?php elseif ($action === 'verify_code'): ?>
+        <div class="text-center mt-16">
+            <a href="?view=login" class="link">← Back to Login</a>
+        </div>
+
+        <?php elseif ($view === 'verify_code'): ?>
+
+        <div class="steps">
+            <div class="step done">✓</div>
+            <div class="step-line"></div>
+            <div class="step active">2</div>
+            <div class="step-line"></div>
+            <div class="step">3</div>
+        </div>
+
+        <h2 style="font-size:18px;margin-bottom:4px;color:#1a1a2e">Enter Verification Code</h2>
+        <p style="font-size:12px;color:#888;margin-bottom:20px">
+            A 6-digit code was sent to <strong><?= h($_SESSION['reset_email'] ?? '') ?></strong>
+        </p>
+
+        <?php if (isset($_SESSION['reset_token_data']['code'])): ?>
+        <div class="code-display">
+            <div style="font-size:14px; color:#666; margin-bottom:5px;">🔑 Development Code:</div>
+            <div class="code"><?= $_SESSION['reset_token_data']['code'] ?></div>
+            <div style="font-size:12px; color:#999; margin-top:5px;">Copy this code to verify</div>
+        </div>
+        <?php endif; ?>
+
         <form method="POST">
             <input type="hidden" name="action" value="verify_code">
 
-            <p style="font-size:13px;color:#555;margin-bottom:18px;">
-                Enter the 6-digit code sent to
-                <strong><?= htmlspecialchars($_SESSION['reset_email'] ?? '') ?></strong>.
-            </p>
-
             <div class="form-group">
-                <label>Verification Code</label>
-                <input type="text" name="code" placeholder="000000" maxlength="6"
-                       pattern="[0-9]{6}" required style="letter-spacing:6px;font-size:18px;text-align:center;">
+                <label>6-Digit Code</label>
+                <input type="text" name="code" required maxlength="6" placeholder="000000"
+                       style="letter-spacing:8px;font-size:22px;text-align:center"
+                       pattern="\d{6}" inputmode="numeric" autocomplete="off">
             </div>
 
-            <button type="submit" class="btn">Verify Code →</button>
-
-            <div class="link-row">
-                <a href="?action=forgot">Resend code</a>
-                &nbsp;|&nbsp;
-                <a href="?action=login">← Back to Login</a>
-            </div>
+            <button type="submit" class="btn-primary">Verify Code</button>
         </form>
 
-        <?php elseif ($action === 'reset'): ?>
-        <form method="POST">
-            <input type="hidden" name="action" value="reset">
+        <div class="text-center mt-16" style="display:flex;justify-content:space-between">
+            <a href="?view=forgot" class="link">← Try different email</a>
+            <a href="?view=login"  class="link">Cancel</a>
+        </div>
 
-            <p style="font-size:13px;color:#555;margin-bottom:18px;">
-                Create a new strong password.
-            </p>
+        <?php elseif ($view === 'reset_password'): ?>
+
+        <div class="steps">
+            <div class="step done">✓</div>
+            <div class="step-line"></div>
+            <div class="step done">✓</div>
+            <div class="step-line"></div>
+            <div class="step active">3</div>
+        </div>
+
+        <h2 style="font-size:18px;margin-bottom:4px;color:#1a1a2e">Set New Password</h2>
+        <p style="font-size:12px;color:#888;margin-bottom:20px">Choose a strong password you haven't used recently</p>
+
+        <form method="POST">
+            <input type="hidden" name="action" value="reset_password">
 
             <div class="form-group">
                 <label>New Password</label>
-                <div class="pw-wrap">
-                    <input type="password" name="password" id="newPw" placeholder="New password" required>
-                    <button type="button" class="pw-toggle" onclick="togglePw('newPw',this)">Show</button>
-                </div>
+                <input type="password" name="password" required placeholder="Min 8 chars">
+                <div class="hint">Must include uppercase, lowercase, number, and special character</div>
             </div>
 
             <div class="form-group">
                 <label>Confirm New Password</label>
-                <input type="password" name="confirm_password" placeholder="Repeat new password" required>
+                <input type="password" name="confirm_password" required placeholder="Repeat password">
             </div>
 
-            <p class="pw-hint">8+ chars · uppercase · lowercase · number · special character</p>
-
-            <button type="submit" class="btn" style="margin-top:14px;">Change Password →</button>
+            <button type="submit" class="btn-primary">Reset Password</button>
         </form>
+
+        <div class="text-center mt-16">
+            <a href="?view=login" class="link">Cancel</a>
+        </div>
+
         <?php endif; ?>
 
     </div>
 </div>
 
-<script>
-    function selectRole(role) {
-        document.querySelectorAll('.role-btn').forEach(b => b.classList.remove('active'));
-        document.getElementById('role-' + role).classList.add('active');
-        document.getElementById('roleInput').value = role;
-    }
-
-    function togglePw(id, btn) {
-        const f = document.getElementById(id);
-        if (f.type === 'password') {
-            f.type = 'text';
-            btn.textContent = 'Hide';
-        } else {
-            f.type = 'password';
-            btn.textContent = 'Show';
-        }
-    }
-</script>
 </body>
 </html>
