@@ -11,25 +11,37 @@ if($_SERVER['REQUEST_METHOD'] === 'POST'){
     if(empty($email) || empty($password)){
         $message = "❌ Please fill in all fields";
     } else {
-        $stmt = $conn->prepare("SELECT student_id, name, email, course_id, year FROM students WHERE email = ? AND password = ? AND deleted = 0 AND status = 'active'");
-        $stmt->bind_param("ss", $email, $password);
-        $stmt->execute();
-        $result = $stmt->get_result();
-        
-        if($result->num_rows > 0){
-            $student = $result->fetch_assoc();
-            $_SESSION['student_id'] = $student['student_id'];
-            $_SESSION['student_name'] = $student['name'];
-            $_SESSION['course_id'] = $student['course_id'];
-            $_SESSION['year'] = $student['year'];
-            $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-            
-            header("Location: dashboard.php");
-            exit();
+        // Query to get student - fetch password separately
+        $stmt = $conn->prepare("SELECT student_id, name, course_id, year, password FROM students WHERE email = ? AND deleted = 0 AND status = 'active'");
+        if(!$stmt){
+            $message = "❌ Database error: " . $conn->error;
         } else {
-            $message = "❌ Invalid email or password, or account not active";
+            $stmt->bind_param("s", $email);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            
+            if($result->num_rows > 0){
+                $student = $result->fetch_assoc();
+                
+                // Check password - supports both plaintext and hashed
+                if($student['password'] === $password || password_verify($password, $student['password'])){
+                    session_regenerate_id(true);
+                    $_SESSION['student_id'] = $student['student_id'];
+                    $_SESSION['student_name'] = $student['name'];
+                    $_SESSION['course_id'] = $student['course_id'];
+                    $_SESSION['year'] = $student['year'];
+                    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+                    
+                    header("Location: dashboard.php", true, 302);
+                    exit();
+                } else {
+                    $message = "❌ Invalid email or password, or account not active";
+                }
+            } else {
+                $message = "❌ Invalid email or password, or account not active";
+            }
+            $stmt->close();
         }
-        $stmt->close();
     }
 }
 
@@ -38,6 +50,8 @@ if($_SERVER['REQUEST_METHOD'] === 'POST'){
 <!DOCTYPE html>
 <html>
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Student Login - CSMS</title>
     <link rel="stylesheet" href="../assets/css/auth.css">
     <style>
@@ -48,6 +62,7 @@ if($_SERVER['REQUEST_METHOD'] === 'POST'){
             justify-content: center;
             min-height: 100vh;
             padding: 20px;
+            font-family: Arial, sans-serif;
         }
 
         .auth-card {
@@ -93,6 +108,7 @@ if($_SERVER['REQUEST_METHOD'] === 'POST'){
             border-radius: 6px;
             font-size: 14px;
             transition: all 0.3s;
+            font-family: Arial, sans-serif;
         }
 
         input[type="email"]:focus,
@@ -100,6 +116,7 @@ if($_SERVER['REQUEST_METHOD'] === 'POST'){
             outline: none;
             border-color: #16a085;
             box-shadow: 0 0 0 3px rgba(22, 160, 133, 0.1);
+            background: #f8fafb;
         }
 
         .password-group {
@@ -117,6 +134,10 @@ if($_SERVER['REQUEST_METHOD'] === 'POST'){
             font-size: 12px;
             font-weight: 600;
             padding: 0;
+        }
+
+        .password-toggle:hover {
+            color: #117a65;
         }
 
         .checkbox-group {
@@ -151,6 +172,10 @@ if($_SERVER['REQUEST_METHOD'] === 'POST'){
             box-shadow: 0 8px 16px rgba(22, 160, 133, 0.3);
         }
 
+        button:active {
+            transform: translateY(0);
+        }
+
         .message {
             background: #fadbd8;
             color: #c0392b;
@@ -159,6 +184,11 @@ if($_SERVER['REQUEST_METHOD'] === 'POST'){
             margin-bottom: 20px;
             font-size: 13px;
             border-left: 4px solid #c0392b;
+            display: none;
+        }
+
+        .message.show {
+            display: block;
         }
 
         .back-link {
@@ -185,7 +215,7 @@ if($_SERVER['REQUEST_METHOD'] === 'POST'){
     <p class="subtitle">View your courses, modules, and results</p>
 
     <?php if($message): ?>
-        <div class="message"><?= htmlspecialchars($message) ?></div>
+        <div class="message show"><?= htmlspecialchars($message) ?></div>
     <?php endif; ?>
 
     <form method="POST">
@@ -211,7 +241,7 @@ if($_SERVER['REQUEST_METHOD'] === 'POST'){
     </form>
 
     <div class="back-link">
-        <a href="../index.php">← Back to Login Page</a>
+        <a href="../index.php">← Back to Unified Login</a>
     </div>
 </div>
 
