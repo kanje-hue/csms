@@ -1,283 +1,319 @@
 <?php
+/**
+ * admin/auto_activate_students.php - Auto-Activate All Pending Students
+ */
+
 session_start();
-include '../config/db.php';
+require_once '../config/db.php';
+require_once '../config/security_base.php';
 
-if(!isset($_SESSION['admin_logged_in'])){
-    header("Location: login.php");
-    exit();
-}
-
-if (empty($_SESSION['csrf_token'])) {
-    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-}
+// Check admin login
+checkAdminSession();
 
 $message = "";
 $message_type = "";
+$csrf_token = generateCSRF();
 
-// Auto-activate ALL pending students
-if(isset($_POST['auto_activate'])){
-    if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
-        $message = "Security token verification failed";
-        $message_type = "error";
-    } else {
-        $stmt = $conn->prepare("UPDATE students SET status = 'active' WHERE status = 'pending' AND deleted = 0");
+// Handle auto-activation
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['auto_activate'])) {
+    validateCSRF($_POST['csrf_token'] ?? '');
+    
+    // Get all pending students
+    $pending = $conn->query("
+        SELECT student_id, course_id, year, semester 
+        FROM students 
+        WHERE status = 'pending' AND deleted = 0
+    ");
+    
+    $activated = 0;
+    $enrolled_total = 0;
+    
+    while ($student = $pending->fetch_assoc()) {
+        // Activate student
+        $activate = $conn->prepare("UPDATE students SET status = 'active' WHERE student_id = ?");
+        $activate->bind_param("i", $student['student_id']);
         
-        if($stmt->execute()){
-            $affected = $stmt->affected_rows;
-            $message = "✓ $affected pending student(s) activated successfully! They can now login.";
-            $message_type = "success";
-        } else {
-            $message = "Error activating students";
-            $message_type = "error";
+        if ($activate->execute()) {
+            $activated++;
+            
+            // Get modules for this course/year/semester
+            $modules = $conn->prepare("
+                SELECT module_id FROM modules 
+                WHERE course_id = ? AND year = ? AND semester = ? AND deleted = 0
+            ");
+            $modules->bind_param("iii", $student['course_id'], $student['year'], $student['semester']);
+            $modules->execute();
+            $module_list = $modules->get_result()->fetch_all(MYSQLI_ASSOC);
+            $modules->close();
+            
+            // Enroll in each module
+            foreach ($module_list as $module) {
+                $enroll = $conn->prepare("INSERT IGNORE INTO module_enrollments (student_id, module_id, enrolled_at) VALUES (?, ?, NOW())");
+                $enroll->bind_param("ii", $student['student_id'], $module['module_id']);
+                if ($enroll->execute()) {
+                    $enrolled_total++;
+                }
+                $enroll->close();
+            }
         }
-        $stmt->close();
+        $activate->close();
     }
+    
+    $message = "✓ $activated students activated and enrolled in $enrolled_total modules";
+    $message_type = "success";
+    
+    logAdminAction($conn, $_SESSION['admin_id'], 'auto_activate', "Auto-activated $activated students");
 }
 
-// Count pending students
-$count_stmt = $conn->prepare("SELECT COUNT(*) as pending FROM students WHERE status = 'pending' AND deleted = 0");
-$count_stmt->execute();
-$pending_count = $count_stmt->get_result()->fetch_assoc()['pending'];
-$count_stmt->close();
+// Get statistics
+$pending_count = $conn->query("SELECT COUNT(*) as count FROM students WHERE status = 'pending' AND deleted = 0")->fetch_assoc()['count'];
 
-// Get all pending students
-$query = "
+// Get pending by course
+$by_course = $conn->query("
     SELECT 
-        s.student_id,
-        s.reg_number,
-        s.name,
-        s.email,
-        s.status,
-        s.year,
-        s.semester,
         c.course_name,
-        s.created_at
+        COUNT(*) as pending_count
     FROM students s
-    LEFT JOIN courses c ON s.course_id = c.course_id
+    JOIN courses c ON s.course_id = c.course_id
     WHERE s.status = 'pending' AND s.deleted = 0
-    ORDER BY s.created_at DESC
-";
-
-$stmt = $conn->prepare($query);
-$stmt->execute();
-$students = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-$stmt->close();
-
+    GROUP BY c.course_id, c.course_name
+    ORDER BY pending_count DESC
+")->fetch_all(MYSQLI_ASSOC);
 ?>
-
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Auto-Activate Students</title>
+    <title>Auto-Activate Students - CSMS</title>
     <link rel="stylesheet" href="../assets/css/auth.css">
     <style>
-        .auth-card {
-            width: 900px;
-            max-width: 100%;
-            padding: 30px;
-            border-radius: 18px;
-            background: var(--white);
-            box-shadow: 0 20px 45px rgba(0,0,0,0.15);
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f5f7fa;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #1a1a2e, #16213e);
+            color: white;
+            padding: 20px 30px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .container {
+            max-width: 800px;
             margin: 30px auto;
+            padding: 0 20px;
         }
-
-        h2 {
-            text-align: center;
-            margin-bottom: 15px;
-            color: var(--midnight-garden);
+        
+        .breadcrumb {
+            background: white;
+            padding: 15px 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }
-
+        
+        .breadcrumb a {
+            color: #16a085;
+            text-decoration: none;
+        }
+        
+        .page-header {
+            margin-bottom: 30px;
+        }
+        
+        .page-header h1 {
+            color: #1a1a2e;
+            font-size: 24px;
+        }
+        
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: bold;
+            text-decoration: none;
+            display: inline-block;
+        }
+        
+        .btn-primary {
+            background: #16a085;
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            background: #117a65;
+        }
+        
+        .btn-danger {
+            background: #e74c3c;
+            color: white;
+        }
+        
         .alert {
             padding: 15px;
-            margin: 15px 0;
             border-radius: 8px;
-            display: none;
-            font-weight: bold;
+            margin-bottom: 20px;
         }
-
+        
         .alert.success {
             background: #d4edda;
             color: #155724;
-            display: block;
             border: 1px solid #c3e6cb;
         }
-
-        .alert.error {
-            background: #f8d7da;
-            color: #721c24;
-            display: block;
-            border: 1px solid #f5c6cb;
-        }
-
-        .stats-box {
-            background: linear-gradient(135deg, #cce5ff, #e3f2fd);
-            padding: 25px;
-            border-radius: 10px;
+        
+        .stats-card {
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.1);
             text-align: center;
+        }
+        
+        .pending-number {
+            font-size: 72px;
+            font-weight: bold;
+            color: #16a085;
+            line-height: 1;
             margin: 20px 0;
         }
-
-        .stats-number {
-            font-size: 40px;
-            font-weight: bold;
-            color: #004085;
-            margin: 10px 0;
-        }
-
-        .stats-label {
-            color: #004085;
-            font-size: 16px;
-        }
-
-        .btn-activate {
-            display: inline-block;
-            padding: 12px 30px;
-            background: linear-gradient(135deg, #4CAF50, #45a049);
-            color: white;
-            border: none;
+        
+        .warning-box {
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+            padding: 20px;
             border-radius: 8px;
-            cursor: pointer;
-            font-size: 16px;
-            font-weight: bold;
-            margin: 10px 5px;
-        }
-
-        .btn-activate:hover {
-            opacity: 0.9;
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 20px;
-        }
-
-        th, td {
-            padding: 12px;
+            margin: 30px 0;
             text-align: left;
-            border-bottom: 1px solid #ddd;
         }
-
-        th {
-            background: var(--minty-fresh);
-            color: var(--art-craft);
+        
+        .course-list {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .course-list h3 {
+            color: #1a1a2e;
+            margin-bottom: 15px;
+        }
+        
+        .course-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 10px;
+            border-bottom: 1px solid #eee;
+        }
+        
+        .course-item:last-child {
+            border-bottom: none;
+        }
+        
+        .course-name {
             font-weight: bold;
         }
-
-        tr:hover {
-            background: #f9f9f9;
-        }
-
-        .badge {
-            display: inline-block;
-            padding: 4px 8px;
-            border-radius: 4px;
+        
+        .course-count {
+            background: #16a085;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 12px;
             font-size: 12px;
-            font-weight: bold;
-            background: #cce5ff;
-            color: #004085;
         }
-
-        .back-link {
-            text-align: center;
-            margin-top: 20px;
+        
+        .action-buttons {
+            display: flex;
+            gap: 10px;
+            margin-top: 30px;
         }
-
-        .back-link a {
-            color: var(--terra-rosa);
-            text-decoration: none;
-            font-weight: bold;
-        }
-
-        .no-data {
-            text-align: center;
-            padding: 40px;
-            color: #666;
-            background: #f9f9f9;
-            border-radius: 10px;
-        }
-
+        
         @media (max-width: 768px) {
-            .auth-card {
-                width: 95%;
-                padding: 15px;
-            }
-
-            table {
-                font-size: 12px;
-            }
-
-            th, td {
-                padding: 8px;
+            .action-buttons {
+                flex-direction: column;
             }
         }
     </style>
 </head>
 <body>
 
-<div class="auth-card">
-    <h2>⚡ Auto-Activate Pending Students</h2>
+<div class="header">
+    <div style="font-size: 20px;">CSMS Admin</div>
+    <a href="logout.php" style="color: white; text-decoration: none;">🚪 Logout</a>
+</div>
+
+<div class="container">
+    <!-- Breadcrumb -->
+    <div class="breadcrumb">
+        <a href="dashboard.php">Dashboard</a> > 
+        <a href="pending_students.php">Pending Approvals</a> > 
+        <strong>Auto-Activate</strong>
+    </div>
+
+    <!-- Page Header -->
+    <div class="page-header">
+        <h1>⚡ Auto-Activate Pending Students</h1>
+    </div>
 
     <?php if ($message): ?>
-        <div class="alert <?= $message_type === 'success' ? 'success' : 'error' ?>">
-            <?= htmlspecialchars($message) ?>
-        </div>
+        <div class="alert <?= $message_type ?>"><?= $message ?></div>
     <?php endif; ?>
 
-    <!-- Statistics -->
-    <div class="stats-box">
-        <div class="stats-label">Pending Registrations</div>
-        <div class="stats-number"><?= $pending_count ?></div>
-        <?php if ($pending_count > 0): ?>
-            <form method="POST" style="margin-top: 20px;">
-                <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
-                <button type="submit" name="auto_activate" class="btn-activate">
-                    ✓ Activate All <?= $pending_count ?> Student(s)
-                </button>
-            </form>
-        <?php else: ?>
-            <p style="color: #004085; margin-top: 15px;">No pending students!</p>
-        <?php endif; ?>
+    <!-- Stats -->
+    <div class="stats-card">
+        <h2>Pending Approvals</h2>
+        <div class="pending-number"><?= $pending_count ?></div>
+        <p style="color: #666;">students waiting for activation</p>
     </div>
 
-    <!-- Pending Students List -->
-    <?php if(count($students) > 0): ?>
-        <h3 style="margin-top: 30px; color: var(--midnight-garden);">📋 Pending Students</h3>
-        <table>
-            <thead>
-                <tr>
-                    <th>Reg Number</th>
-                    <th>Name</th>
-                    <th>Email</th>
-                    <th>Course</th>
-                    <th>Year</th>
-                    <th>Semester</th>
-                    <th>Registered</th>
-                </tr>
-            </thead>
-            <tbody>
-                <?php foreach ($students as $student): ?>
-                <tr>
-                    <td><strong><?= htmlspecialchars($student['reg_number']) ?></strong></td>
-                    <td><?= htmlspecialchars($student['name']) ?></td>
-                    <td><?= htmlspecialchars($student['email']) ?></td>
-                    <td><?= htmlspecialchars($student['course_name'] ?? 'N/A') ?></td>
-                    <td><?= $student['year'] ?></td>
-                    <td><?= $student['semester'] ?></td>
-                    <td><?= date('M d, Y', strtotime($student['created_at'])) ?></td>
-                </tr>
-                <?php endforeach; ?>
-            </tbody>
-        </table>
+    <!-- Pending by Course -->
+    <?php if (count($by_course) > 0): ?>
+    <div class="course-list">
+        <h3>📊 Pending by Course</h3>
+        <?php foreach ($by_course as $course): ?>
+        <div class="course-item">
+            <span class="course-name"><?= htmlspecialchars($course['course_name']) ?></span>
+            <span class="course-count"><?= $course['pending_count'] ?> pending</span>
+        </div>
+        <?php endforeach; ?>
+    </div>
+    <?php endif; ?>
+
+    <!-- Warning Box -->
+    <div class="warning-box">
+        <strong>⚠️ Important:</strong>
+        <ul style="margin-top: 10px; margin-left: 20px;">
+            <li>This will activate ALL pending students</li>
+            <li>Students will be automatically enrolled in all modules for their course/year/semester</li>
+            <li>Students will receive email notifications (if configured)</li>
+            <li>This action cannot be undone automatically</li>
+        </ul>
+    </div>
+
+    <!-- Action Form -->
+    <?php if ($pending_count > 0): ?>
+    <form method="POST">
+        <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
+        
+        <div class="action-buttons">
+            <button type="submit" name="auto_activate" class="btn btn-primary" onclick="return confirm('Activate ALL <?= $pending_count ?> pending students? This cannot be undone.')">
+                ✓ Activate All <?= $pending_count ?> Students
+            </button>
+            <a href="pending_students.php" class="btn btn-danger">Cancel</a>
+        </div>
+    </form>
     <?php else: ?>
-        <div class="no-data">
-            <p>No pending students! ✓ All students are activated.</p>
-        </div>
+    <div style="text-align: center; padding: 40px; background: white; border-radius: 12px;">
+        <p style="color: #666;">No pending students to activate.</p>
+        <a href="pending_students.php" class="btn btn-primary" style="margin-top: 20px;">Back to Pending</a>
+    </div>
     <?php endif; ?>
 
-    <div class="back-link">
-        <a href="dashboard.php">← Back to Dashboard</a>
-    </div>
+    <a href="dashboard.php" class="btn btn-secondary" style="margin-top: 20px; display: inline-block;">← Back to Dashboard</a>
 </div>
 
 </body>

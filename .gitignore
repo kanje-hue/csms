@@ -1,18 +1,33 @@
 # Log files
-/logs/
+logs/
 *.log
-
-# Development test files (optional - uncomment if you don't want to commit these)
-# public/test_*.php
-# view_logs.php
 
 # OS files
 Thumbs.db
 .DS_Store
+desktop.ini
 
 # IDE files
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Uploaded files (keep structure but not files)
+uploads/*
+!uploads/.gitkeep
+
+# Vendor files (if you want to exclude)
+/vendor/
+
+# Development test files
+test_*.php
+reset_*.php
+stop

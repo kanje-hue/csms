@@ -1,731 +1,917 @@
 <?php
-session_start();
-include '../config/db.php';
-include '../config/email_config.php';
+/**
+ * admin/manage_results.php - Admin Results Management
+ * With working filters and separate view pages
+ */
 
-if(!isset($_SESSION['admin_logged_in'])){
+session_start();
+require_once '../config/db.php';
+require_once '../config/security.php';
+require_once '../config/security_base.php';
+require_once '../config/email_config.php';
+
+// Check admin login
+if (!isset($_SESSION['admin_logged_in']) || !isset($_SESSION['admin_id'])) {
     header("Location: login.php");
     exit();
 }
 
-function safe_int($value) {
-    return filter_var($value, FILTER_VALIDATE_INT);
+// Session timeout
+if (isset($_SESSION['last_activity']) && (time() - $_SESSION['last_activity'] > 3600)) {
+    session_destroy();
+    header("Location: login.php?timeout=1");
+    exit();
 }
+$_SESSION['last_activity'] = time();
 
-function safe_string($value) {
-    return htmlspecialchars(trim($value), ENT_QUOTES, 'UTF-8');
-}
-
-if (empty($_SESSION['csrf_token'])) {
-    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-}
+$admin_id = $_SESSION['admin_id'];
+$admin_name = $_SESSION['admin_name'] ?? 'Admin';
 
 $message = "";
 $message_type = "";
-$admin_name = $_SESSION['admin_name'] ?? 'Admin';
+$csrf_token = generateCSRF();
 
-// Get parameters
-$course_id = isset($_GET['course_id']) ? safe_int($_GET['course_id']) : null;
-$year = isset($_GET['year']) ? safe_int($_GET['year']) : null;
-$semester = isset($_GET['semester']) ? safe_int($_GET['semester']) : null;
-
-if (!$course_id || !$year || !$semester) {
-    header("Location: manage_courses.php");
-    exit();
-}
-
-// Get course name
-$course_stmt = $conn->prepare("SELECT course_name FROM courses WHERE course_id = ? AND deleted = 0");
-$course_stmt->bind_param("i", $course_id);
-$course_stmt->execute();
-$course_result = $course_stmt->get_result()->fetch_assoc();
-$course_name = $course_result['course_name'] ?? 'Unknown';
-$course_stmt->close();
-
-/* ================= REQUEST RESULTS FROM TEACHER ================= */
-if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'request_results'){
-    if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
-        $message = "Security token verification failed";
-        $message_type = "error";
-    } else {
-        $module_id = safe_int($_POST['module_id'] ?? 0);
-        $teacher_id = safe_int($_POST['teacher_id'] ?? 0);
-        $module_code = safe_string($_POST['module_code'] ?? '');
-        $module_name = safe_string($_POST['module_name'] ?? '');
+// Handle Publish Results
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'publish') {
+    validateCSRF($_POST['csrf_token'] ?? '');
+    
+    $module_id = (int)($_POST['module_id'] ?? 0);
+    
+    if ($module_id) {
+        $stmt = $conn->prepare("UPDATE results SET status = 'published' WHERE module_id = ?");
+        $stmt->bind_param("i", $module_id);
         
-        if($module_id && $teacher_id){
-            // Get teacher email and name
-            $teacher_stmt = $conn->prepare("SELECT fullname, email FROM teachers WHERE teacher_id = ?");
-            $teacher_stmt->bind_param("i", $teacher_id);
-            $teacher_stmt->execute();
-            $teacher_result = $teacher_stmt->get_result()->fetch_assoc();
-            $teacher_email = $teacher_result['email'] ?? '';
-            $teacher_fullname = $teacher_result['fullname'] ?? 'Teacher';
-            $teacher_stmt->close();
+        if ($stmt->execute()) {
+            $affected = $stmt->affected_rows;
             
-            // Check if recent request already exists
-            $check_stmt = $conn->prepare("
-                SELECT id FROM notifications 
-                WHERE teacher_id = ? AND module_id = ? AND type = 'result_request'
-                ORDER BY created_at DESC LIMIT 1
+            // Get module details
+            $module_info = $conn->prepare("
+                SELECT m.module_code, m.module_name, c.course_name
+                FROM modules m
+                JOIN courses c ON m.course_id = c.course_id
+                WHERE m.module_id = ?
             ");
-            $check_stmt->bind_param("ii", $teacher_id, $module_id);
-            $check_stmt->execute();
-            $check_result = $check_stmt->get_result();
+            $module_info->bind_param("i", $module_id);
+            $module_info->execute();
+            $module = $module_info->get_result()->fetch_assoc();
+            $module_info->close();
             
-            if($check_result->num_rows === 0){
-                // Create database notification
-                $notification_message = "Admin has requested you to submit results for $module_code";
-                $notif_stmt = $conn->prepare("
-                    INSERT INTO notifications (teacher_id, module_id, type, message, status, created_at)
-                    VALUES (?, ?, 'result_request', ?, 'unread', NOW())
+            // Get all students in this module
+            $students = $conn->prepare("
+                SELECT s.student_id, s.name, s.email 
+                FROM students s
+                JOIN results r ON s.student_id = r.student_id
+                WHERE r.module_id = ? AND s.status = 'active'
+            ");
+            $students->bind_param("i", $module_id);
+            $students->execute();
+            $student_list = $students->get_result()->fetch_all(MYSQLI_ASSOC);
+            $students->close();
+            
+            // Create notifications
+            foreach ($student_list as $student) {
+                $notif_msg = "Your results for {$module['module_code']} have been published";
+                $notif = $conn->prepare("
+                    INSERT INTO notifications (user_type, user_id, module_id, type, message, status, created_at)
+                    VALUES ('student', ?, ?, 'result_published', ?, 'unread', NOW())
                 ");
-                $notif_stmt->bind_param("iis", $teacher_id, $module_id, $notification_message);
-                
-                if($notif_stmt->execute()){
-                    // Send email notification
-                    if($teacher_email){
-                        $email_subject = "📧 Results Request - $module_code";
-                        
-                        $email_body = "
-                        <html>
-                        <head>
-                            <style>
-                                body { font-family: Arial, sans-serif; background: #f5f5f5; }
-                                .container { max-width: 600px; margin: 20px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-                                .header { background: linear-gradient(135deg, #c46a6a, #f2c66d); color: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
-                                .header h1 { margin: 0; font-size: 24px; }
-                                .content { line-height: 1.6; color: #333; }
-                                .module-info { background: #f9f9f9; padding: 15px; border-left: 4px solid #c46a6a; border-radius: 5px; margin: 20px 0; }
-                                .module-info p { margin: 5px 0; }
-                                .footer { text-align: center; padding: 20px; color: #999; font-size: 12px; border-top: 1px solid #eee; margin-top: 20px; }
-                            </style>
-                        </head>
-                        <body>
-                            <div class='container'>
-                                <div class='header'>
-                                    <h1>📧 Results Request</h1>
-                                </div>
-                                
-                                <div class='content'>
-                                    <p>Hello <strong>$teacher_fullname</strong>,</p>
-                                    <p>The admin has requested you to submit results for the following module:</p>
-                                    
-                                    <div class='module-info'>
-                                        <p><strong>Course:</strong> $course_name</p>
-                                        <p><strong>Module Code:</strong> $module_code</p>
-                                        <p><strong>Module Name:</strong> $module_name</p>
-                                    </div>
-                                    
-                                    <p>Please log in to submit the results.</p>
-                                    <p>Best regards, <strong>CSMS Administrator</strong></p>
-                                </div>
-                                
-                                <div class='footer'>
-                                    <p>Automated message from CSMS. Please do not reply.</p>
-                                </div>
-                            </div>
-                        </body>
-                        </html>
-                        ";
-                        
-                        send_email($teacher_email, $teacher_fullname, $email_subject, $email_body);
-                    }
-                    
-                    $message = "✓ Request sent to teacher";
-                    $message_type = "success";
-                } else {
-                    $message = "Error creating notification";
-                    $message_type = "error";
-                }
-                $notif_stmt->close();
-            } else {
-                $message = "Request already sent";
-                $message_type = "info";
+                $notif->bind_param("iis", $student['student_id'], $module_id, $notif_msg);
+                $notif->execute();
+                $notif->close();
             }
-            $check_stmt->close();
+            
+            logAdminAction($conn, $admin_id, 'publish_results', "Published results for module ID: $module_id");
+            $message = "✓ Results published for {$module['module_code']}. $affected results updated.";
+            $message_type = "success";
         }
+        $stmt->close();
     }
 }
 
-/* ================= PUBLISH RESULTS & NOTIFY STUDENTS ================= */
-if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'publish'){
-    if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
-        $message = "Security token verification failed";
-        $message_type = "error";
-    } else {
-        $result_id = safe_int($_POST['result_id'] ?? 0);
-        $module_id = safe_int($_POST['module_id'] ?? 0);
+// Handle Unpublish Results
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'unpublish') {
+    validateCSRF($_POST['csrf_token'] ?? '');
+    
+    $module_id = (int)($_POST['module_id'] ?? 0);
+    
+    if ($module_id) {
+        $stmt = $conn->prepare("UPDATE results SET status = 'draft' WHERE module_id = ?");
+        $stmt->bind_param("i", $module_id);
         
-        if($result_id){
-            $stmt = $conn->prepare("UPDATE results SET status = 'published' WHERE id = ?");
-            $stmt->bind_param("i", $result_id);
-            
-            if($stmt->execute()){
-                // Get module and course info
-                $module_info_stmt = $conn->prepare("
-                    SELECT m.module_code, m.module_name, c.course_name
-                    FROM modules m
-                    JOIN courses c ON m.course_id = c.course_id
-                    WHERE m.module_id = ?
-                ");
-                $module_info_stmt->bind_param("i", $module_id);
-                $module_info_stmt->execute();
-                $module_info = $module_info_stmt->get_result()->fetch_assoc();
-                $module_info_stmt->close();
-                
-                // Get all students in this module and notify them
-                $students_stmt = $conn->prepare("
-                    SELECT DISTINCT s.student_id, s.name, s.email
-                    FROM students s
-                    JOIN results r ON s.student_id = r.student_id
-                    WHERE r.module_id = ? AND s.status = 'active'
-                ");
-                $students_stmt->bind_param("i", $module_id);
-                $students_stmt->execute();
-                $students = $students_stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-                $students_stmt->close();
-                
-                // Send notification to each student
-                foreach($students as $student){
-                    // Create in-system notification
-                    $notif_msg = "Your results for {$module_info['module_code']} have been published";
-                    $student_notif_stmt = $conn->prepare("
-                        INSERT INTO notifications (student_id, module_id, type, message, status, created_at)
-                        VALUES (?, ?, 'result_published', ?, 'unread', NOW())
-                    ");
-                    $student_notif_stmt->bind_param("iis", $student['student_id'], $module_id, $notif_msg);
-                    $student_notif_stmt->execute();
-                    $student_notif_stmt->close();
-                    
-                    // Send email notification
-                    if($student['email']){
-                        $email_subject = "📊 Your Results Are Published - {$module_info['module_code']}";
-                        
-                        $email_body = "
-                        <html>
-                        <head>
-                            <style>
-                                body { font-family: Arial, sans-serif; background: #f5f5f5; }
-                                .container { max-width: 600px; margin: 20px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-                                .header { background: linear-gradient(135deg, #4CAF50, #45a049); color: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
-                                .header h1 { margin: 0; font-size: 24px; }
-                                .content { line-height: 1.6; color: #333; }
-                                .module-info { background: #f0f8f0; padding: 15px; border-left: 4px solid #4CAF50; border-radius: 5px; margin: 20px 0; }
-                                .module-info p { margin: 5px 0; }
-                                .btn { display: inline-block; background: #4CAF50; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin-top: 15px; }
-                                .footer { text-align: center; padding: 20px; color: #999; font-size: 12px; border-top: 1px solid #eee; margin-top: 20px; }
-                            </style>
-                        </head>
-                        <body>
-                            <div class='container'>
-                                <div class='header'>
-                                    <h1>✅ Results Published!</h1>
-                                </div>
-                                
-                                <div class='content'>
-                                    <p>Hello <strong>{$student['name']}</strong>,</p>
-                                    <p>Great news! Your results have been published for:</p>
-                                    
-                                    <div class='module-info'>
-                                        <p><strong>Course:</strong> {$module_info['course_name']}</p>
-                                        <p><strong>Module Code:</strong> {$module_info['module_code']}</p>
-                                        <p><strong>Module Name:</strong> {$module_info['module_name']}</p>
-                                    </div>
-                                    
-                                    <p>You can now log in to the CSMS system to view your results.</p>
-                                    <a href='#' class='btn'>View Your Results</a>
-                                    
-                                    <p>Best regards, <strong>CSMS System</strong></p>
-                                </div>
-                                
-                                <div class='footer'>
-                                    <p>Automated message from CSMS. Please do not reply.</p>
-                                </div>
-                            </div>
-                        </body>
-                        </html>
-                        ";
-                        
-                        send_email($student['email'], $student['name'], $email_subject, $email_body);
-                    }
-                }
-                
-                $message = "✓ Result published & " . count($students) . " students notified";
-                $message_type = "success";
-            } else {
-                $message = "Error publishing result";
-                $message_type = "error";
-            }
-            $stmt->close();
+        if ($stmt->execute()) {
+            logAdminAction($conn, $admin_id, 'unpublish_results', "Unpublished results for module ID: $module_id");
+            $message = "✓ Results unpublished";
+            $message_type = "success";
         }
+        $stmt->close();
     }
 }
 
-/* ================= UNPUBLISH RESULTS ================= */
-if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'unpublish'){
-    if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
-        $message = "Security token verification failed";
-        $message_type = "error";
-    } else {
-        $result_id = safe_int($_POST['result_id'] ?? 0);
+// Handle Bulk Publish
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'bulk_publish') {
+    validateCSRF($_POST['csrf_token'] ?? '');
+    
+    $module_ids = $_POST['module_ids'] ?? [];
+    $published_count = 0;
+    
+    if (empty($module_ids)) {
+        // Get all modules with draft results
+        $draft_modules = $conn->query("
+            SELECT DISTINCT module_id FROM results WHERE status = 'draft'
+        ")->fetch_all(MYSQLI_ASSOC);
+        $module_ids = array_column($draft_modules, 'module_id');
+    }
+    
+    foreach ($module_ids as $module_id) {
+        $module_id = (int)$module_id;
+        if ($module_id) {
+            $publish = $conn->prepare("UPDATE results SET status = 'published' WHERE module_id = ? AND status = 'draft'");
+            $publish->bind_param("i", $module_id);
+            $publish->execute();
+            $published_count += $publish->affected_rows;
+            $publish->close();
+        }
+    }
+    
+    logAdminAction($conn, $admin_id, 'bulk_publish', "Bulk published $published_count results");
+    $message = "✓ Bulk publish complete! $published_count results published.";
+    $message_type = "success";
+}
+
+// Handle Bulk Unpublish
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'bulk_unpublish') {
+    validateCSRF($_POST['csrf_token'] ?? '');
+    
+    $module_ids = $_POST['module_ids'] ?? [];
+    $unpublished_count = 0;
+    
+    if (empty($module_ids)) {
+        // Get all modules with published results
+        $published_modules = $conn->query("
+            SELECT DISTINCT module_id FROM results WHERE status = 'published'
+        ")->fetch_all(MYSQLI_ASSOC);
+        $module_ids = array_column($published_modules, 'module_id');
+    }
+    
+    foreach ($module_ids as $module_id) {
+        $module_id = (int)$module_id;
+        if ($module_id) {
+            $unpublish = $conn->prepare("UPDATE results SET status = 'draft' WHERE module_id = ? AND status = 'published'");
+            $unpublish->bind_param("i", $module_id);
+            $unpublish->execute();
+            $unpublished_count += $unpublish->affected_rows;
+            $unpublish->close();
+        }
+    }
+    
+    logAdminAction($conn, $admin_id, 'bulk_unpublish', "Bulk unpublished $unpublished_count results");
+    $message = "✓ Bulk unpublish complete! $unpublished_count results unpublished.";
+    $message_type = "success";
+}
+
+// Handle Request Results from Teacher
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'request_results') {
+    validateCSRF($_POST['csrf_token'] ?? '');
+    
+    $module_id = (int)($_POST['module_id'] ?? 0);
+    $teacher_id = (int)($_POST['teacher_id'] ?? 0);
+    $module_code = sanitizeInput($_POST['module_code'] ?? '');
+    $module_name = sanitizeInput($_POST['module_name'] ?? '');
+    $teacher_email = sanitizeInput($_POST['teacher_email'] ?? '');
+    $teacher_name = sanitizeInput($_POST['teacher_name'] ?? 'Teacher');
+    
+    if ($module_id && $teacher_id && $teacher_email) {
+        // Check if recent request already exists
+        $check_stmt = $conn->prepare("
+            SELECT id FROM notifications 
+            WHERE user_type = 'teacher' AND user_id = ? AND module_id = ? AND type = 'result_request'
+            AND created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+        ");
+        $check_stmt->bind_param("ii", $teacher_id, $module_id);
+        $check_stmt->execute();
         
-        if($result_id){
-            $stmt = $conn->prepare("UPDATE results SET status = 'draft' WHERE id = ?");
-            $stmt->bind_param("i", $result_id);
+        if ($check_stmt->get_result()->num_rows === 0) {
+            // Create database notification
+            $notification_message = "Admin has requested you to submit results for $module_code - $module_name";
+            $notif_stmt = $conn->prepare("
+                INSERT INTO notifications (user_type, user_id, module_id, type, message, status, created_at)
+                VALUES ('teacher', ?, ?, 'result_request', ?, 'unread', NOW())
+            ");
+            $notif_stmt->bind_param("iis", $teacher_id, $module_id, $notification_message);
             
-            if($stmt->execute()){
-                $message = "✓ Result unpublished successfully";
+            if ($notif_stmt->execute()) {
+                // Send email notification
+                $email_subject = "📧 Results Request: $module_code";
+                $email_body = "
+                <html>
+                <body style='font-family: Arial, sans-serif;'>
+                    <h2 style='color: #0d9488;'>Results Request</h2>
+                    <p>Hello <strong>$teacher_name</strong>,</p>
+                    <p>Admin has requested you to submit results for <strong>$module_code - $module_name</strong>.</p>
+                    <p><a href='http://localhost/csms/teacher/upload_results.php?module_id=$module_id' style='background: #0d9488; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;'>Submit Results</a></p>
+                </body>
+                </html>
+                ";
+                
+                send_email($teacher_email, $teacher_name, $email_subject, $email_body);
+                logAdminAction($conn, $admin_id, 'request_results', "Requested results for module ID: $module_id");
+                $message = "✓ Request sent to $teacher_name";
                 $message_type = "success";
-            } else {
-                $message = "Error unpublishing result";
-                $message_type = "error";
             }
-            $stmt->close();
+            $notif_stmt->close();
+        } else {
+            $message = "Request already sent within the last 24 hours";
+            $message_type = "warning";
         }
+        $check_stmt->close();
     }
 }
 
-// Get all modules with results for this course/year/semester
+// Get filter parameters
+$course_filter = isset($_GET['course_id']) ? (int)$_GET['course_id'] : 0;
+$year_filter = isset($_GET['year']) ? (int)$_GET['year'] : 0;
+$semester_filter = isset($_GET['semester']) ? (int)$_GET['semester'] : 0;
+$status_filter = isset($_GET['status']) ? $_GET['status'] : 'all';
+
+// Build WHERE clause
+$where = ["m.deleted = 0"];
+$params = [];
+$types = "";
+
+if ($course_filter > 0) {
+    $where[] = "m.course_id = ?";
+    $params[] = $course_filter;
+    $types .= "i";
+}
+if ($year_filter > 0) {
+    $where[] = "m.year = ?";
+    $params[] = $year_filter;
+    $types .= "i";
+}
+if ($semester_filter > 0) {
+    $where[] = "m.semester = ?";
+    $params[] = $semester_filter;
+    $types .= "i";
+}
+
+$where_clause = "WHERE " . implode(" AND ", $where);
+
+// Get all courses for filter dropdown
+$courses = $conn->query("SELECT course_id, course_name FROM courses WHERE deleted = 0 ORDER BY course_name")->fetch_all(MYSQLI_ASSOC);
+
+// Get all modules with their results
 $modules_query = "
     SELECT 
         m.module_id,
         m.module_code,
         m.module_name,
-        m.teacher_id,
-        COALESCE(t.fullname, t.email, 'Unassigned') as teacher_name,
-        COUNT(r.id) as total_results,
+        m.year,
+        m.semester,
+        c.course_id,
+        c.course_name,
+        t.teacher_id,
+        t.fullname as teacher_name,
+        t.email as teacher_email,
+        COUNT(DISTINCT r.id) as total_results,
         SUM(CASE WHEN r.status = 'published' THEN 1 ELSE 0 END) as published_results,
         SUM(CASE WHEN r.status = 'draft' THEN 1 ELSE 0 END) as draft_results,
-        COUNT(DISTINCT r.student_id) as students_with_results,
-        MAX(r.id) as last_result_id,
-        MAX(r.status) as last_result_status
+        COUNT(DISTINCT r.student_id) as students_with_results
     FROM modules m
+    JOIN courses c ON m.course_id = c.course_id
     LEFT JOIN teachers t ON m.teacher_id = t.teacher_id
     LEFT JOIN results r ON m.module_id = r.module_id
-    WHERE m.course_id = ? AND m.year = ? AND m.semester = ? AND m.deleted = 0
-    GROUP BY m.module_id, m.module_code, m.module_name, m.teacher_id, t.fullname, t.email
-    ORDER BY m.module_code ASC
+    $where_clause
+    GROUP BY m.module_id, m.module_code, m.module_name, m.year, m.semester, c.course_id, c.course_name, t.teacher_id, t.fullname, t.email
+    ORDER BY c.course_name, m.year, m.semester, m.module_code
 ";
 
-$modules_stmt = $conn->prepare($modules_query);
-$modules_stmt->bind_param("iii", $course_id, $year, $semester);
-$modules_stmt->execute();
-$modules = $modules_stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-$modules_stmt->close();
+$stmt = $conn->prepare($modules_query);
+if (!empty($params)) {
+    $stmt->bind_param($types, ...$params);
+}
+$stmt->execute();
+$modules = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$stmt->close();
 
 // Calculate statistics
 $total_modules = count($modules);
-$modules_with_results = 0;
-$modules_without_results = 0;
+$modules_with_drafts = count(array_filter($modules, fn($m) => $m['draft_results'] > 0));
+$modules_with_results = count(array_filter($modules, fn($m) => $m['total_results'] > 0));
+$modules_without_results = count(array_filter($modules, fn($m) => $m['total_results'] == 0));
+$total_drafts = array_sum(array_column($modules, 'draft_results'));
+$total_published = array_sum(array_column($modules, 'published_results'));
 
-foreach($modules as $module) {
-    if($module['total_results'] > 0) {
-        $modules_with_results++;
-    } else {
-        $modules_without_results++;
-    }
-}
-
+// Get module IDs for bulk actions
+$draft_module_ids = array_column(array_filter($modules, fn($m) => $m['draft_results'] > 0), 'module_id');
+$published_module_ids = array_column(array_filter($modules, fn($m) => $m['published_results'] > 0), 'module_id');
 ?>
-
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Manage Results - CSMS</title>
-    <link rel="stylesheet" href="../assets/css/auth.css">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Manage Results - CSMS Admin</title>
     <style>
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 20px;
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
 
-        .auth-card {
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f0f2f5;
+            color: #1e293b;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #0f172a, #1e293b);
+            color: white;
+            padding: 1rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            position: sticky;
+            top: 0;
+            z-index: 100;
             width: 100%;
-            max-width: 1200px;
-            margin: 0 auto;
         }
 
-        .alert {
-            padding: 15px;
-            margin: 15px 0;
-            border-radius: 5px;
-            display: none;
+        .header h1 {
+            font-size: 1.8rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #2dd4bf, #14b8a6);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
         }
 
-        .alert.success {
-            background: #d4edda;
-            color: #155724;
-            display: block;
-            border: 1px solid #c3e6cb;
+        .header .admin-info {
+            display: flex;
+            align-items: center;
+            gap: 2rem;
         }
 
-        .alert.error {
-            background: #f8d7da;
-            color: #721c24;
-            display: block;
-            border: 1px solid #f5c6cb;
+        .header .logout-btn {
+            color: white;
+            text-decoration: none;
+            padding: 0.5rem 1.2rem;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            transition: all 0.3s;
         }
 
-        .alert.info {
-            background: #d1ecf1;
-            color: #0c5460;
-            display: block;
-            border: 1px solid #bee5eb;
+        .header .logout-btn:hover {
+            background: #2dd4bf;
         }
 
-        h2 {
-            text-align: center;
-            color: #333;
-            margin-bottom: 10px;
+        .container {
+            max-width: 1400px;
+            margin: 2rem auto;
+            padding: 0 2rem;
         }
 
         .breadcrumb {
-            text-align: center;
-            color: #666;
-            margin-bottom: 30px;
-            font-size: 14px;
-        }
-
-        .breadcrumb strong {
-            color: #333;
-        }
-
-        /* Statistics Section */
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 15px;
-            margin: 20px 0;
-        }
-
-        .stat-box {
-            background: linear-gradient(135deg, var(--terra-rosa), var(--honey-glow));
-            color: white;
-            padding: 20px;
-            border-radius: 10px;
-            text-align: center;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-
-        .stat-box h3 {
-            margin: 0;
-            font-size: 14px;
-            opacity: 0.9;
-        }
-
-        .stat-number {
-            font-size: 32px;
-            font-weight: bold;
-            margin-top: 10px;
-        }
-
-        /* Results Table */
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 20px;
             background: white;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            border-radius: 8px;
-            overflow: hidden;
+            padding: 1rem 1.5rem;
+            border-radius: 12px;
+            margin-bottom: 2rem;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
         }
 
-        th {
-            background: linear-gradient(135deg, var(--skipping-stones), var(--minty-fresh));
-            color: var(--art-craft);
-            padding: 15px;
-            text-align: left;
-            font-weight: bold;
-            border-bottom: 2px solid #ddd;
-            font-size: 13px;
+        .breadcrumb a {
+            color: #0d9488;
+            text-decoration: none;
+            font-weight: 500;
         }
 
-        td {
-            padding: 12px 15px;
-            border-bottom: 1px solid #eee;
-            font-size: 13px;
-        }
-
-        tr:hover {
-            background: #f9f9f9;
-        }
-
-        tr:last-child td {
-            border-bottom: none;
-        }
-
-        .module-code {
-            font-weight: bold;
-            color: var(--midnight-garden);
-        }
-
-        .status-badge {
-            display: inline-block;
-            padding: 5px 12px;
-            border-radius: 20px;
-            font-size: 11px;
-            font-weight: bold;
-        }
-
-        .status-published {
-            background: #d4edda;
-            color: #155724;
-        }
-
-        .status-draft {
-            background: #fff3cd;
-            color: #856404;
-        }
-
-        .status-no-results {
-            background: #f8d7da;
-            color: #721c24;
-        }
-
-        .actions {
+        .page-header {
             display: flex;
-            gap: 6px;
-            flex-wrap: wrap;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+        }
+
+        .page-header h1 {
+            font-size: 2rem;
+            color: #0f172a;
         }
 
         .btn {
-            padding: 6px 10px;
+            padding: 0.8rem 1.5rem;
             border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 11px;
-            font-weight: bold;
+            border-radius: 10px;
+            font-weight: 600;
             text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
             transition: all 0.3s;
+            cursor: pointer;
+        }
+
+        .btn-primary {
+            background: #0d9488;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #115e59;
+            transform: translateY(-2px);
+        }
+
+        .btn-success {
+            background: #10b981;
+            color: white;
+        }
+
+        .btn-success:hover {
+            background: #059669;
+        }
+
+        .btn-warning {
+            background: #f59e0b;
+            color: white;
+        }
+
+        .btn-secondary {
+            background: #e2e8f0;
+            color: #0f172a;
+        }
+
+        .alert {
+            padding: 1rem;
+            border-radius: 8px;
+            margin-bottom: 1.5rem;
+        }
+
+        .alert.success {
+            background: #d1fae5;
+            color: #065f46;
+            border-left: 4px solid #10b981;
+        }
+
+        .alert.warning {
+            background: #fef3c7;
+            color: #92400e;
+            border-left: 4px solid #f59e0b;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .stat-card {
+            background: white;
+            padding: 1.5rem;
+            border-radius: 16px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            border-left: 4px solid #0d9488;
+        }
+
+        .stat-number {
+            font-size: 2rem;
+            font-weight: 700;
+            color: #0f172a;
+        }
+
+        .stat-label {
+            color: #64748b;
+            font-size: 0.9rem;
+            margin-top: 0.25rem;
+        }
+
+        .filter-section {
+            background: white;
+            border-radius: 16px;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+
+        .filter-form {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            align-items: flex-end;
+        }
+
+        .filter-group label {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+            color: #0f172a;
+            font-size: 0.9rem;
+        }
+
+        .filter-group select,
+        .filter-group input {
+            width: 100%;
+            padding: 0.8rem;
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 0.95rem;
+        }
+
+        .filter-actions {
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+        }
+
+        .bulk-actions {
+            background: white;
+            border-radius: 16px;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            display: flex;
+            gap: 1rem;
+            align-items: center;
+        }
+
+        .bulk-actions h3 {
+            margin-right: auto;
+            color: #0f172a;
+        }
+
+        .module-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 1.5rem;
+            margin-top: 1.5rem;
+        }
+
+        .module-card {
+            background: white;
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            border-left: 4px solid #0d9488;
+            transition: transform 0.3s;
+        }
+
+        .module-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 12px 20px -8px rgba(0, 0, 0, 0.15);
+        }
+
+        .module-card.pending {
+            border-left-color: #f59e0b;
+        }
+
+        .module-header {
+            background: linear-gradient(135deg, #0f172a, #1e293b);
+            color: white;
+            padding: 1rem;
+        }
+
+        .module-code {
+            font-size: 1.1rem;
+            font-weight: 600;
+        }
+
+        .module-course {
+            font-size: 0.85rem;
+            opacity: 0.8;
+            margin-top: 0.25rem;
+        }
+
+        .module-body {
+            padding: 1rem;
+        }
+
+        .stats-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 0.5rem;
+            padding: 0.5rem 0;
+            border-bottom: 1px solid #e2e8f0;
+        }
+
+        .badge {
             display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+
+        .badge-published {
+            background: #d1fae5;
+            color: #065f46;
+        }
+
+        .badge-draft {
+            background: #fef3c7;
+            color: #92400e;
+        }
+
+        .badge-none {
+            background: #e2e8f0;
+            color: #475569;
+        }
+
+        .teacher-info {
+            font-size: 0.9rem;
+            color: #64748b;
+            margin: 0.5rem 0;
+        }
+
+        .action-buttons {
+            display: flex;
+            gap: 0.5rem;
+            margin-top: 1rem;
+            flex-wrap: wrap;
+        }
+
+        .action-btn {
+            flex: 1;
+            min-width: 80px;
+            padding: 0.5rem;
+            border: none;
+            border-radius: 6px;
+            font-weight: 500;
+            font-size: 0.8rem;
+            cursor: pointer;
+            text-decoration: none;
+            text-align: center;
         }
 
         .btn-view {
-            background: #2196F3;
-            color: white;
-        }
-
-        .btn-view:hover {
-            background: #0b7dda;
+            background: #e2e8f0;
+            color: #0f172a;
         }
 
         .btn-publish {
-            background: #4CAF50;
+            background: #10b981;
             color: white;
-        }
-
-        .btn-publish:hover {
-            background: #45a049;
         }
 
         .btn-unpublish {
-            background: #FF9800;
+            background: #f59e0b;
             color: white;
-        }
-
-        .btn-unpublish:hover {
-            background: #E68900;
         }
 
         .btn-request {
-            background: #9C27B0;
-            color: white;
+            background: #fef3c7;
+            color: #92400e;
         }
 
-        .btn-request:hover {
-            background: #7B1FA2;
-        }
-
-        .back-btn {
-            display: inline-block;
-            padding: 10px 20px;
-            background: #2196F3;
-            color: white;
-            text-decoration: none;
-            border-radius: 6px;
-            margin-bottom: 20px;
-            font-weight: bold;
-        }
-
-        .back-btn:hover {
-            background: #0b7dda;
-        }
-
-        .no-data {
+        .back-link {
+            margin-top: 2rem;
             text-align: center;
-            padding: 40px;
-            color: #666;
-            font-size: 16px;
+        }
+
+        .no-results {
+            text-align: center;
+            padding: 3rem;
+            background: white;
+            border-radius: 16px;
+            color: #64748b;
+            grid-column: 1 / -1;
         }
 
         @media (max-width: 768px) {
             .container {
-                padding: 10px;
+                padding: 0 1rem;
             }
 
-            .stats-grid {
+            .filter-form {
                 grid-template-columns: 1fr;
             }
 
-            table {
-                font-size: 11px;
-            }
-
-            th, td {
-                padding: 8px;
-            }
-
-            .actions {
+            .bulk-actions {
                 flex-direction: column;
+                align-items: stretch;
             }
 
-            .btn {
-                width: 100%;
-                text-align: center;
+            .module-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .action-buttons {
+                flex-direction: column;
             }
         }
     </style>
 </head>
 <body>
 
+<div class="header">
+    <h1>CSMS Admin</h1>
+    <div class="admin-info">
+        <span>Welcome, <?= htmlspecialchars($admin_name) ?></span>
+        <a href="dashboard.php" class="logout-btn">Dashboard</a>
+        <a href="logout.php" class="logout-btn">Logout</a>
+    </div>
+</div>
+
 <div class="container">
-    <div class="auth-card">
-        <h2>📊 Manage Results</h2>
+    <div class="breadcrumb">
+        <a href="dashboard.php">Dashboard</a> > 
+        <strong>Results Management</strong>
+    </div>
 
-        <div class="breadcrumb">
-            <strong><?= htmlspecialchars($course_name) ?></strong> | Year <strong><?= $year ?></strong> | Semester <strong><?= $semester ?></strong>
+    <div class="page-header">
+        <h1>📊 Results Management</h1>
+        <a href="dashboard.php" class="btn btn-secondary">← Back to Dashboard</a>
+    </div>
+
+    <?php if ($message): ?>
+        <div class="alert <?= $message_type ?>"><?= $message ?></div>
+    <?php endif; ?>
+
+    <!-- Statistics -->
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-number"><?= $total_modules ?></div>
+            <div class="stat-label">Total Modules</div>
         </div>
-
-        <!-- Alert Messages -->
-        <?php if ($message): ?>
-            <div class="alert <?= $message_type === 'success' ? 'success' : ($message_type === 'info' ? 'info' : 'error') ?>">
-                <?= htmlspecialchars($message) ?>
-            </div>
-        <?php endif; ?>
-
-        <a href="manage_courses.php" class="back-btn">← Back to Manage Courses</a>
-
-        <!-- Statistics Section -->
-        <div class="stats-grid">
-            <div class="stat-box">
-                <h3>📚 Total Modules</h3>
-                <div class="stat-number"><?= $total_modules ?></div>
-            </div>
-            <div class="stat-box">
-                <h3>✅ Results Sent</h3>
-                <div class="stat-number"><?= $modules_with_results ?></div>
-            </div>
-            <div class="stat-box">
-                <h3>⏳ Pending</h3>
-                <div class="stat-number"><?= $modules_without_results ?></div>
-            </div>
+        <div class="stat-card">
+            <div class="stat-number"><?= $modules_with_results ?></div>
+            <div class="stat-label">Modules with Results</div>
         </div>
+        <div class="stat-card">
+            <div class="stat-number"><?= $modules_with_drafts ?></div>
+            <div class="stat-label">Pending Review</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number"><?= $modules_without_results ?></div>
+            <div class="stat-label">No Results Yet</div>
+        </div>
+    </div>
 
-        <!-- Results Table -->
-        <?php if ($total_modules > 0): ?>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Module Code</th>
-                        <th>Module Name</th>
-                        <th>Teacher</th>
-                        <th>Total Results</th>
-                        <th>Status</th>
-                        <th>Published</th>
-                        <th>Draft</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <?php foreach($modules as $module): ?>
-                    <tr>
-                        <td class="module-code"><?= htmlspecialchars($module['module_code']) ?></td>
-                        <td><?= htmlspecialchars(substr($module['module_name'], 0, 25)) ?></td>
-                        <td><?= htmlspecialchars($module['teacher_name']) ?></td>
-                        <td>
-                            <?php if($module['total_results'] > 0): ?>
-                                <strong><?= $module['total_results'] ?></strong> students
-                            <?php else: ?>
-                                <span style="color: #999;">No results</span>
-                            <?php endif; ?>
-                        </td>
-                        <td>
-                            <?php if($module['total_results'] == 0): ?>
-                                <span class="status-badge status-no-results">No Results</span>
-                            <?php elseif($module['draft_results'] > 0 && $module['published_results'] == 0): ?>
-                                <span class="status-badge status-draft">All Draft</span>
-                            <?php elseif($module['published_results'] > 0 && $module['draft_results'] == 0): ?>
-                                <span class="status-badge status-published">All Published</span>
-                            <?php else: ?>
-                                <span class="status-badge status-draft">Mixed</span>
-                            <?php endif; ?>
-                        </td>
-                        <td>
-                            <?php if($module['published_results'] > 0): ?>
-                                <span class="status-badge status-published"><?= $module['published_results'] ?></span>
-                            <?php else: ?>
-                                <span style="color: #999;">0</span>
-                            <?php endif; ?>
-                        </td>
-                        <td>
-                            <?php if($module['draft_results'] > 0): ?>
-                                <span class="status-badge status-draft"><?= $module['draft_results'] ?></span>
-                            <?php else: ?>
-                                <span style="color: #999;">0</span>
-                            <?php endif; ?>
-                        </td>
-                        <td>
-                            <div class="actions">
-                                <?php if($module['total_results'] > 0): ?>
-                                    <a href="view_results.php?module_id=<?= $module['module_id'] ?>" class="btn btn-view">👁️ View</a>
-                                    
-                                    <?php if($module['draft_results'] > 0): ?>
-                                    <form method="POST" style="display: inline;">
-                                        <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
-                                        <input type="hidden" name="action" value="publish">
-                                        <input type="hidden" name="result_id" value="<?= $module['last_result_id'] ?>">
-                                        <input type="hidden" name="module_id" value="<?= $module['module_id'] ?>">
-                                        <button type="submit" class="btn btn-publish" onclick="return confirm('Publish results & notify all students?')">📤 Pub</button>
-                                    </form>
-                                    <?php endif; ?>
-
-                                    <?php if($module['published_results'] > 0): ?>
-                                    <form method="POST" style="display: inline;">
-                                        <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
-                                        <input type="hidden" name="action" value="unpublish">
-                                        <input type="hidden" name="result_id" value="<?= $module['last_result_id'] ?>">
-                                        <button type="submit" class="btn btn-unpublish" onclick="return confirm('Unpublish results?')">📥 Unpub</button>
-                                    </form>
-                                    <?php endif; ?>
-                                <?php else: ?>
-                                    <?php if($module['teacher_id']): ?>
-                                    <form method="POST" style="display: inline;">
-                                        <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
-                                        <input type="hidden" name="action" value="request_results">
-                                        <input type="hidden" name="module_id" value="<?= $module['module_id'] ?>">
-                                        <input type="hidden" name="teacher_id" value="<?= $module['teacher_id'] ?>">
-                                        <input type="hidden" name="module_code" value="<?= htmlspecialchars($module['module_code']) ?>">
-                                        <input type="hidden" name="module_name" value="<?= htmlspecialchars($module['module_name']) ?>">
-                                        <button type="submit" class="btn btn-request" onclick="return confirm('Request results from teacher?')">📧 Request</button>
-                                    </form>
-                                    <?php else: ?>
-                                    <span style="color: #999; font-size: 11px;">No teacher</span>
-                                    <?php endif; ?>
-                                <?php endif; ?>
-                            </div>
-                        </td>
-                    </tr>
+    <!-- Filter Section -->
+    <div class="filter-section">
+        <h3 style="margin-bottom: 1rem;">🔍 Filter Modules</h3>
+        <form method="GET" class="filter-form">
+            <div class="filter-group">
+                <label>Course</label>
+                <select name="course_id">
+                    <option value="0">All Courses</option>
+                    <?php foreach ($courses as $course): ?>
+                    <option value="<?= $course['course_id'] ?>" <?= $course_filter == $course['course_id'] ? 'selected' : '' ?>>
+                        <?= htmlspecialchars($course['course_name']) ?>
+                    </option>
                     <?php endforeach; ?>
-                </tbody>
-            </table>
-        <?php else: ?>
-            <div class="no-data">
-                <p>❌ No modules found for this course/year/semester combination</p>
+                </select>
             </div>
-        <?php endif; ?>
+            <div class="filter-group">
+                <label>Year</label>
+                <select name="year">
+                    <option value="0">All Years</option>
+                    <option value="1" <?= $year_filter == 1 ? 'selected' : '' ?>>Year 1</option>
+                    <option value="2" <?= $year_filter == 2 ? 'selected' : '' ?>>Year 2</option>
+                    <option value="3" <?= $year_filter == 3 ? 'selected' : '' ?>>Year 3</option>
+                </select>
+            </div>
+            <div class="filter-group">
+                <label>Semester</label>
+                <select name="semester">
+                    <option value="0">All Semesters</option>
+                    <option value="1" <?= $semester_filter == 1 ? 'selected' : '' ?>>Semester 1</option>
+                    <option value="2" <?= $semester_filter == 2 ? 'selected' : '' ?>>Semester 2</option>
+                </select>
+            </div>
+            <div class="filter-group">
+                <label>&nbsp;</label>
+                <div class="filter-actions">
+                    <button type="submit" class="btn btn-primary" style="flex: 1;">Apply Filters</button>
+                    <a href="manage_results.php" class="btn btn-secondary">Reset</a>
+                </div>
+            </div>
+        </form>
+    </div>
 
+    <!-- Bulk Actions -->
+    <?php if (!empty($draft_module_ids) || !empty($published_module_ids)): ?>
+    <div class="bulk-actions">
+        <h3>⚡ Bulk Actions</h3>
+        
+        <?php if (!empty($draft_module_ids)): ?>
+        <form method="POST" style="display: inline;">
+            <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
+            <input type="hidden" name="action" value="bulk_publish">
+            <?php foreach ($draft_module_ids as $id): ?>
+            <input type="hidden" name="module_ids[]" value="<?= $id ?>">
+            <?php endforeach; ?>
+            <button type="submit" class="btn btn-success" onclick="return confirm('Publish all pending results?')">
+                📤 Publish All Pending (<?= count($draft_module_ids) ?>)
+            </button>
+        </form>
+        <?php endif; ?>
+        
+        <?php if (!empty($published_module_ids)): ?>
+        <form method="POST" style="display: inline;">
+            <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
+            <input type="hidden" name="action" value="bulk_unpublish">
+            <?php foreach ($published_module_ids as $id): ?>
+            <input type="hidden" name="module_ids[]" value="<?= $id ?>">
+            <?php endforeach; ?>
+            <button type="submit" class="btn btn-warning" onclick="return confirm('Unpublish all published results?')">
+                📥 Unpublish All Published (<?= count($published_module_ids) ?>)
+            </button>
+        </form>
+        <?php endif; ?>
+    </div>
+    <?php endif; ?>
+
+    <!-- Modules Grid -->
+    <h2 style="margin: 2rem 0 1rem;">📚 Modules Status</h2>
+    
+    <?php if (count($modules) > 0): ?>
+    <div class="module-grid">
+        <?php foreach ($modules as $module): 
+            $status_class = $module['draft_results'] > 0 ? 'pending' : '';
+        ?>
+        <div class="module-card <?= $status_class ?>">
+            <div class="module-header">
+                <div class="module-code"><?= htmlspecialchars($module['module_code']) ?></div>
+                <div class="module-course"><?= htmlspecialchars($module['course_name']) ?></div>
+            </div>
+            <div class="module-body">
+                <div class="stats-row">
+                    <span>Published:</span>
+                    <span class="badge badge-published"><?= $module['published_results'] ?></span>
+                </div>
+                <div class="stats-row">
+                    <span>Draft:</span>
+                    <span class="badge <?= $module['draft_results'] > 0 ? 'badge-draft' : 'badge-none' ?>">
+                        <?= $module['draft_results'] ?>
+                    </span>
+                </div>
+                <div class="stats-row">
+                    <span>Status:</span>
+                    <?php if ($module['total_results'] == 0): ?>
+                        <span class="badge badge-none">No Results</span>
+                    <?php elseif ($module['draft_results'] > 0): ?>
+                        <span class="badge badge-draft">Pending Review</span>
+                    <?php else: ?>
+                        <span class="badge badge-published">Published</span>
+                    <?php endif; ?>
+                </div>
+                
+                <div class="teacher-info">
+                    👨‍🏫 Teacher: <?= htmlspecialchars($module['teacher_name'] ?? 'Not Assigned') ?>
+                </div>
+
+                <div class="action-buttons">
+                    <?php if ($module['total_results'] > 0): ?>
+                        <a href="view_results.php?module_id=<?= $module['module_id'] ?>" class="action-btn btn-view">👁️ View Results</a>
+                        
+                        <?php if ($module['draft_results'] > 0): ?>
+                        <form method="POST" style="flex: 1;">
+                            <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
+                            <input type="hidden" name="action" value="publish">
+                            <input type="hidden" name="module_id" value="<?= $module['module_id'] ?>">
+                            <button type="submit" class="action-btn btn-publish">📤 Publish</button>
+                        </form>
+                        <?php endif; ?>
+
+                        <?php if ($module['published_results'] > 0): ?>
+                        <form method="POST" style="flex: 1;">
+                            <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
+                            <input type="hidden" name="action" value="unpublish">
+                            <input type="hidden" name="module_id" value="<?= $module['module_id'] ?>">
+                            <button type="submit" class="action-btn btn-unpublish">📥 Unpublish</button>
+                        </form>
+                        <?php endif; ?>
+                        
+                    <?php else: ?>
+                        <?php if ($module['teacher_id']): ?>
+                        <form method="POST" style="flex: 1;">
+                            <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
+                            <input type="hidden" name="action" value="request_results">
+                            <input type="hidden" name="module_id" value="<?= $module['module_id'] ?>">
+                            <input type="hidden" name="teacher_id" value="<?= $module['teacher_id'] ?>">
+                            <input type="hidden" name="module_code" value="<?= htmlspecialchars($module['module_code']) ?>">
+                            <input type="hidden" name="module_name" value="<?= htmlspecialchars($module['module_name']) ?>">
+                            <input type="hidden" name="teacher_email" value="<?= htmlspecialchars($module['teacher_email'] ?? '') ?>">
+                            <input type="hidden" name="teacher_name" value="<?= htmlspecialchars($module['teacher_name'] ?? 'Teacher') ?>">
+                            <button type="submit" class="action-btn btn-request">📧 Request</button>
+                        </form>
+                        <?php else: ?>
+                        <span style="color: #64748b; text-align: center; padding: 0.5rem;">No teacher assigned</span>
+                        <?php endif; ?>
+                    <?php endif; ?>
+                </div>
+            </div>
+        </div>
+        <?php endforeach; ?>
+    </div>
+    <?php else: ?>
+    <div class="no-results">
+        <p>No modules found matching your filters.</p>
+    </div>
+    <?php endif; ?>
+
+    <div class="back-link">
+        <a href="dashboard.php">← Back to Dashboard</a>
     </div>
 </div>
 

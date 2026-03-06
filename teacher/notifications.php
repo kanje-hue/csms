@@ -1,26 +1,43 @@
 <?php
-session_start();
-include '../config/db.php';
+/**
+ * teacher/notifications.php - Teacher Notification Center
+ */
 
-if(!isset($_SESSION['teacher_logged_in'])){
+session_start();
+require_once '../config/db.php';
+require_once '../config/security_base.php';
+
+// Check teacher login
+if (!isset($_SESSION['teacher_logged_in']) || !isset($_SESSION['teacher_id'])) {
     header("Location: login.php");
     exit();
 }
 
-$teacher_id = $_SESSION['teacher_id'] ?? null;
+$teacher_id = $_SESSION['teacher_id'];
+$teacher_name = $_SESSION['teacher_name'] ?? 'Teacher';
 
 // Mark notification as read
-if(isset($_GET['read_id'])){
-    $notif_id = filter_var($_GET['read_id'], FILTER_VALIDATE_INT);
-    if($notif_id){
-        $stmt = $conn->prepare("UPDATE notifications SET status = 'read', read_at = NOW() WHERE id = ? AND teacher_id = ?");
-        $stmt->bind_param("ii", $notif_id, $teacher_id);
-        $stmt->execute();
-        $stmt->close();
-    }
+if (isset($_GET['read_id'])) {
+    $notif_id = (int)$_GET['read_id'];
+    $stmt = $conn->prepare("UPDATE notifications SET status = 'read' WHERE id = ? AND user_id = ? AND user_type = 'teacher'");
+    $stmt->bind_param("ii", $notif_id, $teacher_id);
+    $stmt->execute();
+    $stmt->close();
+    header("Location: notifications.php");
+    exit();
 }
 
-// Get unread notifications
+// Mark all as read
+if (isset($_GET['read_all'])) {
+    $stmt = $conn->prepare("UPDATE notifications SET status = 'read' WHERE user_id = ? AND user_type = 'teacher' AND status = 'unread'");
+    $stmt->bind_param("i", $teacher_id);
+    $stmt->execute();
+    $stmt->close();
+    header("Location: notifications.php");
+    exit();
+}
+
+// Get notifications
 $notif_stmt = $conn->prepare("
     SELECT 
         n.id,
@@ -32,197 +49,338 @@ $notif_stmt = $conn->prepare("
         m.module_name,
         c.course_name
     FROM notifications n
-    JOIN modules m ON n.module_id = m.module_id
-    JOIN courses c ON m.course_id = c.course_id
-    WHERE n.teacher_id = ? 
+    LEFT JOIN modules m ON n.module_id = m.module_id
+    LEFT JOIN courses c ON m.course_id = c.course_id
+    WHERE n.user_id = ? AND n.user_type = 'teacher'
     ORDER BY n.created_at DESC
+    LIMIT 50
 ");
 $notif_stmt->bind_param("i", $teacher_id);
 $notif_stmt->execute();
 $notifications = $notif_stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $notif_stmt->close();
 
-$unread_count = count(array_filter($notifications, function($n) { return $n['status'] === 'unread'; }));
+// Count unread
+$unread_count = count(array_filter($notifications, fn($n) => $n['status'] === 'unread'));
 ?>
-
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Notifications - CSMS</title>
-    <link rel="stylesheet" href="../assets/css/auth.css">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Notifications - CSMS Teacher</title>
     <style>
-        .container {
-            max-width: 900px;
-            margin: 0 auto;
-            padding: 20px;
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
 
-        .auth-card {
-            width: 100%;
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f0f2f5;
+            color: #1e293b;
         }
 
-        h2 {
-            text-align: center;
-            color: #333;
-            margin-bottom: 20px;
-        }
-
-        .notif-header {
+        .header {
+            background: linear-gradient(135deg, #0f172a, #1e293b);
+            color: white;
+            padding: 1rem 2rem;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 20px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            width: 100%;
         }
 
-        .badge {
-            background: var(--terra-rosa);
+        .header h1 {
+            font-size: 1.8rem;
+            background: linear-gradient(135deg, #2dd4bf, #14b8a6);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .header a {
             color: white;
-            padding: 5px 12px;
-            border-radius: 20px;
-            font-size: 14px;
-            font-weight: bold;
-        }
-
-        .notification-item {
-            background: white;
-            padding: 15px;
-            border-left: 4px solid var(--terra-rosa);
-            border-radius: 6px;
-            margin-bottom: 15px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            text-decoration: none;
+            padding: 0.5rem 1.2rem;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.1);
             transition: all 0.3s;
         }
 
-        .notification-item:hover {
-            box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+        .header a:hover {
+            background: #2dd4bf;
         }
 
-        .notification-item.unread {
-            background: #f0f8ff;
-            border-left-color: #2196F3;
+        .container {
+            max-width: 900px;
+            margin: 2rem auto;
+            padding: 0 2rem;
         }
 
-        .notif-title {
-            font-weight: bold;
-            color: var(--midnight-garden);
-            margin-bottom: 5px;
+        .page-header {
             display: flex;
+            justify-content: space-between;
             align-items: center;
-            gap: 10px;
+            margin-bottom: 2rem;
         }
 
-        .email-badge {
-            background: #4CAF50;
+        .page-header h2 {
+            font-size: 1.8rem;
+            color: #0f172a;
+        }
+
+        .badge {
+            background: #2dd4bf;
             color: white;
-            padding: 2px 8px;
-            border-radius: 4px;
-            font-size: 11px;
-            font-weight: bold;
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
         }
 
-        .notif-module {
-            font-size: 13px;
-            color: #666;
-            margin-bottom: 8px;
-        }
-
-        .notif-message {
-            font-size: 14px;
-            color: #333;
-            margin-bottom: 10px;
-        }
-
-        .notif-time {
-            font-size: 12px;
-            color: #999;
-        }
-
-        .notif-actions {
-            text-align: right;
-            margin-top: 10px;
-        }
-
-        .btn-mark-read {
-            padding: 5px 12px;
-            background: #2196F3;
-            color: white;
+        .btn {
+            padding: 0.6rem 1.2rem;
             border: none;
-            border-radius: 4px;
+            border-radius: 8px;
+            font-weight: 600;
             cursor: pointer;
-            font-size: 12px;
+            transition: all 0.3s;
             text-decoration: none;
             display: inline-block;
         }
 
-        .btn-mark-read:hover {
-            background: #0b7dda;
+        .btn-primary {
+            background: #2dd4bf;
+            color: white;
         }
 
-        .no-notif {
+        .btn-primary:hover {
+            background: #14b8a6;
+            transform: translateY(-2px);
+        }
+
+        .btn-secondary {
+            background: #e2e8f0;
+            color: #0f172a;
+        }
+
+        .btn-secondary:hover {
+            background: #cbd5e1;
+        }
+
+        .notifications-list {
+            background: white;
+            border-radius: 20px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+
+        .notification-item {
+            padding: 1.5rem;
+            border-bottom: 1px solid #e2e8f0;
+            transition: background 0.3s;
+            display: flex;
+            gap: 1rem;
+        }
+
+        .notification-item:last-child {
+            border-bottom: none;
+        }
+
+        .notification-item.unread {
+            background: #f0f9ff;
+            border-left: 4px solid #2dd4bf;
+        }
+
+        .notification-item:hover {
+            background: #f8fafc;
+        }
+
+        .notification-icon {
+            width: 40px;
+            height: 40px;
+            background: #e0f2fe;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2rem;
+        }
+
+        .notification-content {
+            flex: 1;
+        }
+
+        .notification-title {
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .notification-type {
+            font-size: 0.7rem;
+            background: #e2e8f0;
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            color: #475569;
+        }
+
+        .notification-message {
+            color: #1e293b;
+            margin-bottom: 0.5rem;
+        }
+
+        .notification-meta {
+            display: flex;
+            gap: 1rem;
+            font-size: 0.8rem;
+            color: #64748b;
+        }
+
+        .notification-module {
+            background: #f1f5f9;
+            padding: 0.25rem 0.75rem;
+            border-radius: 4px;
+            color: #0f172a;
+        }
+
+        .notification-actions {
+            margin-top: 0.5rem;
+        }
+
+        .btn-small {
+            padding: 0.25rem 0.75rem;
+            font-size: 0.8rem;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+        }
+
+        .btn-mark-read {
+            background: #2dd4bf;
+            color: white;
+        }
+
+        .empty-state {
             text-align: center;
-            padding: 40px;
-            color: #999;
+            padding: 4rem;
+            color: #64748b;
         }
 
         .back-link {
+            margin-top: 2rem;
             text-align: center;
-            margin-top: 20px;
         }
 
         .back-link a {
-            color: #2196F3;
+            color: #2dd4bf;
             text-decoration: none;
-            font-weight: bold;
+            font-weight: 600;
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                padding: 0 1rem;
+            }
+
+            .page-header {
+                flex-direction: column;
+                gap: 1rem;
+                text-align: center;
+            }
+
+            .notification-item {
+                flex-direction: column;
+            }
         }
     </style>
 </head>
 <body>
 
+<div class="header">
+    <h1>CSMS Teacher</h1>
+    <a href="logout.php">🚪 Logout</a>
+</div>
+
 <div class="container">
-    <div class="auth-card">
+    <div class="page-header">
         <h2>🔔 Notifications</h2>
-
-        <div class="notif-header">
-            <h3 style="margin: 0; color: #333;">Your Requests</h3>
-            <?php if($unread_count > 0): ?>
-            <span class="badge"><?= $unread_count ?> Unread</span>
+        <div>
+            <?php if ($unread_count > 0): ?>
+                <a href="?read_all=1" class="btn btn-primary" onclick="return confirm('Mark all as read?')">✓ Mark All Read</a>
             <?php endif; ?>
+            <a href="dashboard.php" class="btn btn-secondary">← Back</a>
         </div>
+    </div>
 
-        <?php if(count($notifications) > 0): ?>
-            <?php foreach($notifications as $notif): ?>
+    <?php if (count($notifications) > 0): ?>
+        <div class="notifications-list">
+            <?php foreach ($notifications as $notif): ?>
             <div class="notification-item <?= $notif['status'] === 'unread' ? 'unread' : '' ?>">
-                <div class="notif-title">
-                    📧 <?= $notif['type'] === 'result_request' ? 'Result Request' : 'Notification' ?>
-                    <span class="email-badge">✓ Email Sent</span>
+                <div class="notification-icon">
+                    <?php 
+                    if ($notif['type'] === 'result_request') echo '📧';
+                    elseif ($notif['type'] === 'result_published') echo '📊';
+                    else echo '🔔';
+                    ?>
                 </div>
-                <div class="notif-module">
-                    <strong><?= htmlspecialchars($notif['course_name']) ?></strong> - 
-                    <?= htmlspecialchars($notif['module_code']) ?> 
-                    (<?= htmlspecialchars(substr($notif['module_name'], 0, 20)) ?>)
-                </div>
-                <div class="notif-message">
-                    <?= htmlspecialchars($notif['message']) ?>
-                </div>
-                <div style="display: flex; justify-content: space-between;">
-                    <span class="notif-time">
-                        📅 <?= date('M d, Y H:i', strtotime($notif['created_at'])) ?>
-                    </span>
-                    <?php if($notif['status'] === 'unread'): ?>
-                    <a href="?read_id=<?= $notif['id'] ?>" class="btn-mark-read">✓ Mark as Read</a>
+                <div class="notification-content">
+                    <div class="notification-title">
+                        <?php if ($notif['type'] === 'result_request'): ?>
+                            Results Request
+                        <?php elseif ($notif['type'] === 'result_published'): ?>
+                            Results Published
+                        <?php else: ?>
+                            Notification
+                        <?php endif; ?>
+                        <span class="notification-type"><?= ucfirst($notif['type']) ?></span>
+                    </div>
+                    
+                    <div class="notification-message">
+                        <?= htmlspecialchars($notif['message']) ?>
+                    </div>
+                    
+                    <?php if ($notif['module_code']): ?>
+                    <div class="notification-module">
+                        📚 <?= htmlspecialchars($notif['module_code']) ?> - <?= htmlspecialchars(substr($notif['module_name'], 0, 30)) ?>
+                        <?php if ($notif['course_name']): ?>
+                            <span style="color: #64748b;">(<?= htmlspecialchars($notif['course_name']) ?>)</span>
+                        <?php endif; ?>
+                    </div>
+                    <?php endif; ?>
+                    
+                    <div class="notification-meta">
+                        <span>📅 <?= date('M d, Y H:i', strtotime($notif['created_at'])) ?></span>
+                    </div>
+                    
+                    <?php if ($notif['status'] === 'unread'): ?>
+                    <div class="notification-actions">
+                        <a href="?read_id=<?= $notif['id'] ?>" class="btn-small btn-mark-read">✓ Mark as Read</a>
+                    </div>
                     <?php endif; ?>
                 </div>
             </div>
             <?php endforeach; ?>
-        <?php else: ?>
-            <div class="no-notif">
-                <p>✅ No notifications yet!</p>
-            </div>
-        <?php endif; ?>
-
-        <div class="back-link">
-            <a href="dashboard.php">← Back to Dashboard</a>
         </div>
+    <?php else: ?>
+        <div class="empty-state">
+            <p style="font-size: 1.2rem; margin-bottom: 1rem;">📭 No notifications</p>
+            <p>You're all caught up!</p>
+        </div>
+    <?php endif; ?>
+
+    <div class="back-link">
+        <a href="dashboard.php">← Back to Dashboard</a>
     </div>
 </div>
 

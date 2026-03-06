@@ -1,532 +1,616 @@
 <?php
-session_start();
-include '../config/db.php';
+/**
+ * admin/pending_students.php - Manage Pending Student Approvals
+ * CLEANED: Removed extra statistics, fixed header
+ */
 
-if(!isset($_SESSION['admin_logged_in'])){
+session_start();
+require_once '../config/db.php';
+require_once '../config/security_base.php';
+
+// Check admin login
+if (!isset($_SESSION['admin_logged_in'])) {
     header("Location: login.php");
     exit();
 }
 
-function safe_int($value) {
-    return filter_var($value, FILTER_VALIDATE_INT);
-}
-
-function safe_string($value) {
-    return htmlspecialchars(trim($value), ENT_QUOTES, 'UTF-8');
-}
-
-if (empty($_SESSION['csrf_token'])) {
-    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-}
-
 $message = "";
 $message_type = "";
+$csrf_token = generateCSRF();
 
-/* ================= ACTIVATE STUDENT ================= */
-if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'activate'){
-    if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
-        $message = "Security token verification failed";
-        $message_type = "error";
-    } else {
-        $student_id = safe_int($_POST['student_id'] ?? 0);
+// Handle Activate Student
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'activate') {
+    validateCSRF($_POST['csrf_token'] ?? '');
+    
+    $student_id = (int)($_POST['student_id'] ?? 0);
+    
+    if ($student_id) {
+        $stmt = $conn->prepare("UPDATE students SET status = 'active' WHERE student_id = ? AND deleted = 0");
+        $stmt->bind_param("i", $student_id);
         
-        if(!$student_id){
-            $message = "Invalid student ID";
-            $message_type = "error";
-        } else {
-            $stmt = $conn->prepare("UPDATE students SET status = 'active' WHERE student_id = ? AND deleted = 0");
-            $stmt->bind_param("i", $student_id);
-            
-            if($stmt->execute()){
-                $message = "✓ Student activated successfully! They can now login.";
-                $message_type = "success";
-            } else {
-                $message = "Error activating student";
-                $message_type = "error";
-            }
-            $stmt->close();
+        if ($stmt->execute()) {
+            $message = "✓ Student activated successfully!";
+            $message_type = "success";
+            logAdminAction($conn, $_SESSION['admin_id'], 'activate_student', "Activated student ID: $student_id");
         }
+        $stmt->close();
     }
 }
 
-/* ================= REJECT STUDENT ================= */
-if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'reject'){
-    if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
-        $message = "Security token verification failed";
-        $message_type = "error";
-    } else {
-        $student_id = safe_int($_POST['student_id'] ?? 0);
+// Handle Reject Student
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'reject') {
+    validateCSRF($_POST['csrf_token'] ?? '');
+    
+    $student_id = (int)($_POST['student_id'] ?? 0);
+    
+    if ($student_id) {
+        $stmt = $conn->prepare("UPDATE students SET deleted = 1 WHERE student_id = ?");
+        $stmt->bind_param("i", $student_id);
         
-        if(!$student_id){
-            $message = "Invalid student ID";
-            $message_type = "error";
-        } else {
-            $stmt = $conn->prepare("UPDATE students SET deleted = 1 WHERE student_id = ?");
-            $stmt->bind_param("i", $student_id);
-            
-            if($stmt->execute()){
-                $message = "✗ Student registration rejected.";
-                $message_type = "success";
-            } else {
-                $message = "Error rejecting student";
-                $message_type = "error";
-            }
-            $stmt->close();
+        if ($stmt->execute()) {
+            $message = "✗ Student registration rejected";
+            $message_type = "success";
+            logAdminAction($conn, $_SESSION['admin_id'], 'reject_student', "Rejected student ID: $student_id");
         }
+        $stmt->close();
     }
 }
 
-/* ================= FETCH PENDING STUDENTS ================= */
-$search = "";
-$search_term = null;
-$where = "WHERE deleted = 0";
-
-if (isset($_GET['search']) && !empty($_GET['search'])) {
-    $search = safe_string($_GET['search']);
-    $search_term = "%" . $search . "%";
-    $where .= " AND (name LIKE ? OR email LIKE ? OR reg_number LIKE ?)";
+// Handle Bulk Activate
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'bulk_activate') {
+    validateCSRF($_POST['csrf_token'] ?? '');
+    
+    $student_ids = $_POST['student_ids'] ?? [];
+    $activated = 0;
+    
+    foreach ($student_ids as $student_id) {
+        $student_id = (int)$student_id;
+        $activate = $conn->prepare("UPDATE students SET status = 'active' WHERE student_id = ?");
+        $activate->bind_param("i", $student_id);
+        if ($activate->execute()) {
+            $activated++;
+        }
+        $activate->close();
+    }
+    
+    if ($activated > 0) {
+        $message = "✓ $activated students activated successfully!";
+        $message_type = "success";
+        logAdminAction($conn, $_SESSION['admin_id'], 'bulk_activate', "Bulk activated $activated students");
+    }
 }
 
 // Pagination
-$page = isset($_GET['page']) ? safe_int($_GET['page']) : 1;
-if (!$page) $page = 1;
-
-$limit = 15;
+$page = isset($_GET['page']) ? (int)$_GET['page'] : 1;
+$limit = 20;
 $offset = ($page - 1) * $limit;
 
-// Count total
-$count_query = "SELECT COUNT(*) as total FROM students $where";
+// Search
+$search = isset($_GET['search']) ? sanitizeInput($_GET['search']) : '';
+$search_condition = '';
+$search_params = [];
+$search_types = '';
+
+if (!empty($search)) {
+    $search_condition = "AND (s.name LIKE ? OR s.email LIKE ? OR s.reg_number LIKE ?)";
+    $search_term = "%$search%";
+    $search_params = [$search_term, $search_term, $search_term];
+    $search_types = "sss";
+}
+
+// Get total count
+$count_query = "
+    SELECT COUNT(*) as total 
+    FROM students s
+    JOIN courses c ON s.course_id = c.course_id
+    WHERE s.status = 'pending' AND s.deleted = 0
+    $search_condition
+";
 $count_stmt = $conn->prepare($count_query);
 
-if ($search_term) {
-    $count_stmt->bind_param("sss", $search_term, $search_term, $search_term);
+if (!empty($search)) {
+    $count_stmt->bind_param($search_types, ...$search_params);
 }
 $count_stmt->execute();
 $total = $count_stmt->get_result()->fetch_assoc()['total'];
 $pages = ceil($total / $limit);
 $count_stmt->close();
 
-// Fetch pending students
+// Get pending students
 $query = "
     SELECT 
         s.student_id,
         s.reg_number,
         s.name,
         s.email,
-        s.status,
         s.year,
         s.semester,
-        c.course_name,
-        s.created_at
+        s.created_at,
+        c.course_name
     FROM students s
-    LEFT JOIN courses c ON s.course_id = c.course_id
-    $where
-    ORDER BY s.status ASC, s.created_at DESC
-    LIMIT ?, ?
+    JOIN courses c ON s.course_id = c.course_id
+    WHERE s.status = 'pending' AND s.deleted = 0
+    $search_condition
+    ORDER BY s.created_at ASC
+    LIMIT ? OFFSET ?
 ";
 
 $stmt = $conn->prepare($query);
+$params = [];
 
-if ($search_term) {
-    $stmt->bind_param("sssii", $search_term, $search_term, $search_term, $limit, $offset);
+if (!empty($search)) {
+    $params = array_merge($search_params, [$limit, $offset]);
+    $stmt->bind_param($search_types . "ii", ...$params);
 } else {
     $stmt->bind_param("ii", $limit, $offset);
 }
-
 $stmt->execute();
 $students = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $stmt->close();
 
-// Count by status
-$status_counts = $conn->query("
-    SELECT 
-        COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending,
-        COUNT(CASE WHEN status = 'active' THEN 1 END) as active,
-        COUNT(CASE WHEN status = 'inactive' THEN 1 END) as inactive
-    FROM students WHERE deleted = 0
-");
-$counts = $status_counts->fetch_assoc();
-
+// Get total pending count
+$total_pending = $conn->query("SELECT COUNT(*) as count FROM students WHERE status = 'pending' AND deleted = 0")->fetch_assoc()['count'];
 ?>
-
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Pending Students Approval</title>
-    <link rel="stylesheet" href="../assets/css/auth.css">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pending Students - CSMS</title>
     <style>
-        .auth-card {
-            width: 1100px;
-            max-width: 100%;
-            padding: 30px;
-            border-radius: 18px;
-            background: var(--white);
-            box-shadow: 0 20px 45px rgba(0,0,0,0.15);
-            margin: 30px auto;
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
 
-        h2 {
-            text-align: center;
-            margin-bottom: 15px;
-            color: var(--midnight-garden);
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f0f2f5;
+            color: #1e293b;
         }
-
-        .stats {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 15px;
-            margin: 20px 0;
-        }
-
-        .stat-card {
-            background: linear-gradient(135deg, var(--terra-rosa), var(--honey-glow));
+        
+        .header {
+            background: linear-gradient(135deg, #0f172a, #1e293b);
             color: white;
-            padding: 20px;
+            padding: 1rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            width: 100%;
+        }
+
+        .logo h1 {
+            font-size: 1.8rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #2dd4bf, #14b8a6);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .admin-info {
+            display: flex;
+            align-items: center;
+            gap: 2rem;
+        }
+
+        .logout-btn {
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+            padding: 0.5rem 1.2rem;
+            border-radius: 8px;
+            text-decoration: none;
+            transition: all 0.3s;
+        }
+
+        .logout-btn:hover {
+            background: #2dd4bf;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 2rem auto;
+            padding: 0 2rem;
+        }
+
+        .breadcrumb {
+            background: white;
+            padding: 1rem 1.5rem;
+            border-radius: 12px;
+            margin-bottom: 2rem;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+        }
+
+        .breadcrumb a {
+            color: #2dd4bf;
+            text-decoration: none;
+            font-weight: 500;
+        }
+
+        .page-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+            width: 100%;
+        }
+
+        .page-header h1 {
+            font-size: 2rem;
+            color: #0f172a;
+        }
+
+        .btn {
+            padding: 0.8rem 1.5rem;
+            border: none;
             border-radius: 10px;
-            text-align: center;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            font-weight: 600;
+            text-decoration: none;
+            display: inline-block;
+            transition: all 0.3s;
+            cursor: pointer;
         }
 
-        .stat-number {
-            font-size: 32px;
-            font-weight: bold;
+        .btn-primary {
+            background: #2dd4bf;
+            color: white;
         }
 
-        .stat-label {
-            font-size: 14px;
-            margin-top: 5px;
-            opacity: 0.9;
+        .btn-primary:hover {
+            background: #14b8a6;
+        }
+
+        .btn-success {
+            background: #10b981;
+            color: white;
+        }
+
+        .btn-danger {
+            background: #ef4444;
+            color: white;
         }
 
         .alert {
-            padding: 12px;
-            margin: 15px 0;
+            padding: 1rem;
             border-radius: 8px;
-            display: none;
+            margin-bottom: 1.5rem;
         }
 
         .alert.success {
-            background: #d4edda;
-            color: #155724;
-            display: block;
-            border: 1px solid #c3e6cb;
-        }
-
-        .alert.error {
-            background: #f8d7da;
-            color: #721c24;
-            display: block;
-            border: 1px solid #f5c6cb;
+            background: #d1fae5;
+            color: #065f46;
+            border-left: 4px solid #10b981;
         }
 
         .search-box {
+            background: white;
+            padding: 1.5rem;
+            border-radius: 12px;
+            margin-bottom: 2rem;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+
+        .search-form {
             display: flex;
-            gap: 10px;
-            margin-bottom: 20px;
-            justify-content: center;
+            gap: 1rem;
+            align-items: center;
             flex-wrap: wrap;
         }
 
-        .search-box input {
-            padding: 8px 12px;
-            border: 1px solid #ddd;
-            border-radius: 8px;
-            font-size: 14px;
+        .search-form input {
+            flex: 1;
             min-width: 300px;
-        }
-
-        .search-box button {
-            padding: 8px 15px;
-            background: var(--terra-rosa);
-            color: white;
-            border: none;
+            padding: 0.8rem;
+            border: 2px solid #e2e8f0;
             border-radius: 8px;
-            cursor: pointer;
-            font-weight: bold;
+            font-size: 1rem;
         }
 
-        .search-box button:hover {
-            opacity: 0.9;
+        .search-form input:focus {
+            outline: none;
+            border-color: #2dd4bf;
+        }
+
+        .bulk-actions {
+            background: white;
+            padding: 1.5rem;
+            border-radius: 12px;
+            margin-bottom: 2rem;
+            display: flex;
+            gap: 1rem;
+            align-items: center;
+            flex-wrap: wrap;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+
+        .student-table {
+            background: white;
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            width: 100%;
         }
 
         table {
             width: 100%;
             border-collapse: collapse;
-            margin-top: 20px;
-            table-layout: fixed;
-        }
-
-        th, td {
-            padding: 10px;
-            border: 1px solid #566947;
-            text-align: center;
-            word-wrap: break-word;
         }
 
         th {
-            background: var(--minty-fresh);
-            color: var(--art-craft);
-        }
-
-        th:first-child, td:first-child {
+            background: #f8fafc;
+            padding: 1rem;
             text-align: left;
+            font-weight: 600;
+            color: #0f172a;
+            border-bottom: 2px solid #e2e8f0;
         }
 
-        tr:nth-child(even) {
-            background: #f9f9f9;
+        td {
+            padding: 1rem;
+            border-bottom: 1px solid #e2e8f0;
         }
 
-        a.action-link {
-            color: var(--terra-rosa);
-            font-weight: bold;
-            text-decoration: none;
-            margin: 0 5px;
-            cursor: pointer;
+        tr:hover {
+            background: #f8fafc;
         }
 
-        a.action-link:hover {
-            opacity: 0.8;
+        .action-buttons {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
         }
 
-        .badge {
-            display: inline-block;
-            padding: 4px 8px;
-            border-radius: 4px;
-            font-size: 12px;
-            font-weight: bold;
-        }
-
-        .badge-pending {
-            background: #cce5ff;
-            color: #004085;
-        }
-
-        .badge-active {
-            background: #d4edda;
-            color: #155724;
-        }
-
-        .badge-inactive {
-            background: #fff3cd;
-            color: #856404;
-        }
-
-        .btn {
-            display: inline-block;
-            padding: 8px 15px;
-            background: linear-gradient(135deg, var(--terra-rosa), var(--honey-glow));
-            color: #fff;
-            border-radius: 12px;
-            text-decoration: none;
-            font-weight: bold;
-            margin-bottom: 10px;
+        .action-btn {
+            padding: 0.4rem 0.8rem;
             border: none;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 0.8rem;
             cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
         }
 
-        .btn:hover {
-            opacity: 0.9;
+        .btn-activate {
+            background: #d1fae5;
+            color: #065f46;
         }
 
-        .back-btn {
-            float: right;
+        .btn-reject {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        .pagination {
+            margin-top: 2rem;
+            display: flex;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+
+        .pagination a, .pagination span {
+            padding: 0.5rem 1rem;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            text-decoration: none;
+            color: #0f172a;
+        }
+
+        .pagination span.active {
+            background: #2dd4bf;
+            color: white;
+            border-color: #2dd4bf;
         }
 
         .no-data {
             text-align: center;
-            padding: 40px;
-            color: #666;
+            padding: 4rem;
+            color: #64748b;
         }
 
-        .pagination {
+        .back-link {
+            margin-top: 2rem;
             text-align: center;
-            margin-top: 20px;
-            padding: 10px;
-        }
-
-        .pagination a, .pagination span {
-            padding: 5px 10px;
-            margin: 0 3px;
-            border: 1px solid #ddd;
-            border-radius: 5px;
-            text-decoration: none;
-            color: #333;
-        }
-
-        .pagination a:hover {
-            background: #f0f0f0;
-        }
-
-        .pagination span.active {
-            background: var(--terra-rosa);
-            color: white;
-            border-color: var(--terra-rosa);
-        }
-
-        .auth-links {
-            text-align: center;
-            margin-top: 15px;
         }
 
         @media (max-width: 768px) {
-            .auth-card {
-                width: 95%;
-                padding: 15px;
+            .container {
+                padding: 0 1rem;
             }
 
-            .stats {
-                grid-template-columns: 1fr;
+            .bulk-actions {
+                flex-direction: column;
             }
 
-            table {
-                font-size: 12px;
+            .search-form {
+                flex-direction: column;
             }
 
-            th, td {
-                padding: 8px;
-            }
-
-            .back-btn {
-                float: none;
-                display: block;
+            .search-form input {
                 width: 100%;
-                text-align: center;
+                min-width: auto;
+            }
+
+            .action-buttons {
+                flex-direction: column;
             }
         }
     </style>
 </head>
 <body>
 
-<div class="auth-card">
-    <h2>📋 Student Registration Approval</h2>
+<div class="header">
+    <div class="logo">
+        <h1>CSMS Admin</h1>
+    </div>
+    <div class="admin-info">
+        <a href="dashboard.php" class="logout-btn">Dashboard</a>
+        <a href="logout.php" class="logout-btn">Logout</a>
+    </div>
+</div>
 
-    <?php if ($message): ?>
-        <div class="alert <?= $message_type === 'success' ? 'success' : 'error' ?>">
-            <?= htmlspecialchars($message) ?>
-        </div>
-    <?php endif; ?>
-
-    <!-- Statistics -->
-    <div class="stats">
-        <div class="stat-card" style="background: linear-gradient(135deg, #cce5ff, #e3f2fd);">
-            <div class="stat-number" style="color: #004085;"><?= $counts['pending'] ?></div>
-            <div class="stat-label" style="color: #004085;">Pending Approval</div>
-        </div>
-        <div class="stat-card" style="background: linear-gradient(135deg, #d4edda, #c3e6cb);">
-            <div class="stat-number" style="color: #155724;"><?= $counts['active'] ?></div>
-            <div class="stat-label" style="color: #155724;">Active Students</div>
-        </div>
-        <div class="stat-card" style="background: linear-gradient(135deg, #fff3cd, #ffeeba);">
-            <div class="stat-number" style="color: #856404;"><?= $counts['inactive'] ?></div>
-            <div class="stat-label" style="color: #856404;">Inactive</div>
-        </div>
+<div class="container">
+    <div class="breadcrumb">
+        <a href="dashboard.php">Dashboard</a> > 
+        <strong>Pending Approvals</strong>
     </div>
 
-    <a href="dashboard.php" class="btn back-btn">← Back to Dashboard</a>
-    <div style="clear: both;"></div>
+    <div class="page-header">
+        <h1>⏳ Pending Student Approvals</h1>
+        <a href="auto_activate_students.php" class="btn btn-primary">⚡ Auto-Activate All</a>
+    </div>
+
+    <?php if ($message): ?>
+        <div class="alert <?= $message_type ?>"><?= $message ?></div>
+    <?php endif; ?>
 
     <!-- Search -->
     <div class="search-box">
-        <form method="GET" style="display: flex; gap: 10px; width: 100%;">
-            <input type="text" name="search" placeholder="Search by name, email, or reg number..." value="<?= htmlspecialchars($search) ?>">
-            <button type="submit">🔍 Search</button>
-            <?php if(!empty($search)): ?>
-                <a href="pending_students.php" style="padding: 8px 15px; background: #999; color: white; text-decoration: none; border-radius: 8px;">Clear</a>
+        <form method="GET" class="search-form">
+            <input type="text" name="search" placeholder="Search by name, email, or registration number..." value="<?= htmlspecialchars($search) ?>">
+            <button type="submit" class="btn btn-primary">🔍 Search</button>
+            <?php if (!empty($search)): ?>
+                <a href="pending_students.php" class="btn btn-primary" style="background: #6c757d;">Clear</a>
             <?php endif; ?>
         </form>
     </div>
 
-    <!-- Students Table -->
-    <?php if (count($students) > 0): ?>
-        <table>
-            <tr>
-                <th>Reg Number</th>
-                <th>Name</th>
-                <th>Email</th>
-                <th>Course</th>
-                <th>Year</th>
-                <th>Semester</th>
-                <th>Status</th>
-                <th>Registered</th>
-                <th>Actions</th>
-            </tr>
+    <!-- Bulk Actions -->
+    <form method="POST" id="bulkForm">
+        <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
+        <input type="hidden" name="action" value="bulk_activate">
+        
+        <div class="bulk-actions">
+            <span>Selected: <span id="selectedCount">0</span> students</span>
+            <button type="submit" class="btn btn-success" onclick="return confirm('Activate selected students?')">✓ Bulk Activate</button>
+            <button type="button" class="btn btn-primary" onclick="selectAll()">Select All</button>
+            <button type="button" class="btn btn-primary" onclick="deselectAll()">Deselect All</button>
+        </div>
 
-            <?php foreach ($students as $student): ?>
-            <tr>
-                <td><strong><?= htmlspecialchars($student['reg_number']) ?></strong></td>
-                <td><?= htmlspecialchars($student['name']) ?></td>
-                <td><?= htmlspecialchars($student['email']) ?></td>
-                <td><?= htmlspecialchars($student['course_name'] ?? 'N/A') ?></td>
-                <td><?= $student['year'] ?></td>
-                <td><?= $student['semester'] ?></td>
-                <td>
-                    <span class="badge badge-<?= $student['status'] ?>">
-                        <?php 
-                            if($student['status'] === 'pending') {
-                                echo '⏳ Pending';
-                            } elseif($student['status'] === 'active') {
-                                echo '✓ Active';
-                            } else {
-                                echo '⚠️ Inactive';
-                            }
-                        ?>
-                    </span>
-                </td>
-                <td><?= date('M d, Y', strtotime($student['created_at'])) ?></td>
-                <td>
-                    <?php if ($student['status'] === 'pending'): ?>
-                        <form method="POST" style="display: inline;">
-                            <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
-                            <input type="hidden" name="action" value="activate">
-                            <input type="hidden" name="student_id" value="<?= $student['student_id'] ?>">
-                            <a class="action-link" onclick="this.parentForm.submit();" style="color: #4CAF50;">Activate</a>
-                        </form>
-                    <?php endif; ?>
-                    
-                    <?php if ($student['status'] === 'pending'): ?>
-                        <form method="POST" style="display: inline;">
-                            <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
-                            <input type="hidden" name="action" value="reject">
-                            <input type="hidden" name="student_id" value="<?= $student['student_id'] ?>">
-                            <a class="action-link" onclick="if(confirm('Reject this registration?')) this.parentForm.submit(); return false;" style="color: #f44336;">Reject</a>
-                        </form>
-                    <?php endif; ?>
-                </td>
-            </tr>
-            <?php endforeach; ?>
-        </table>
-
-        <?php if ($pages > 1): ?>
-            <div class="pagination">
-                <?php if ($page > 1): ?>
-                    <a href="?page=1<?= !empty($search) ? '&search=' . urlencode($search) : '' ?>">« First</a>
-                    <a href="?page=<?= $page - 1 ?><?= !empty($search) ? '&search=' . urlencode($search) : '' ?>">‹ Previous</a>
-                <?php endif; ?>
-
-                <?php for ($i = max(1, $page - 2); $i <= min($pages, $page + 2); $i++): ?>
-                    <?php if ($i === $page): ?>
-                        <span class="active"><?= $i ?></span>
-                    <?php else: ?>
-                        <a href="?page=<?= $i ?><?= !empty($search) ? '&search=' . urlencode($search) : '' ?>"><?= $i ?></a>
-                    <?php endif; ?>
-                <?php endfor; ?>
-
-                <?php if ($page < $pages): ?>
-                    <a href="?page=<?= $page + 1 ?><?= !empty($search) ? '&search=' . urlencode($search) : '' ?>">Next ›</a>
-                    <a href="?page=<?= $pages ?><?= !empty($search) ? '&search=' . urlencode($search) : '' ?>">Last »</a>
+        <!-- Students Table -->
+        <div class="student-table">
+            <?php if (count($students) > 0): ?>
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width: 40px;">
+                            <input type="checkbox" id="selectAll" onchange="toggleAll(this)">
+                        </th>
+                        <th>Reg Number</th>
+                        <th>Student Name</th>
+                        <th>Email</th>
+                        <th>Course</th>
+                        <th>Year/Sem</th>
+                        <th>Registered</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($students as $student): ?>
+                    <tr>
+                        <td>
+                            <input type="checkbox" name="student_ids[]" value="<?= $student['student_id'] ?>" class="student-checkbox">
+                        </td>
+                        <td><strong><?= htmlspecialchars($student['reg_number']) ?></strong></td>
+                        <td><?= htmlspecialchars($student['name']) ?></td>
+                        <td><?= htmlspecialchars($student['email']) ?></td>
+                        <td><?= htmlspecialchars($student['course_name']) ?></td>
+                        <td>Year <?= $student['year'] ?>, Sem <?= $student['semester'] ?></td>
+                        <td><?= date('M d, Y', strtotime($student['created_at'])) ?></td>
+                        <td>
+                            <div class="action-buttons">
+                                <form method="POST" style="display: inline;">
+                                    <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
+                                    <input type="hidden" name="action" value="activate">
+                                    <input type="hidden" name="student_id" value="<?= $student['student_id'] ?>">
+                                    <button type="submit" class="action-btn btn-activate">✓ Activate</button>
+                                </form>
+                                <form method="POST" style="display: inline;">
+                                    <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
+                                    <input type="hidden" name="action" value="reject">
+                                    <input type="hidden" name="student_id" value="<?= $student['student_id'] ?>">
+                                    <button type="submit" class="action-btn btn-reject" onclick="return confirm('Reject this student?')">✗ Reject</button>
+                                </form>
+                            </div>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+            <?php else: ?>
+            <div class="no-data">
+                <p style="font-size: 1.2rem; margin-bottom: 1rem;">No pending students found</p>
+                <?php if (!empty($search)): ?>
+                    <a href="pending_students.php" class="btn btn-primary">Clear Search</a>
                 <?php endif; ?>
             </div>
-        <?php endif; ?>
-    <?php else: ?>
-        <div class="no-data">
-            <p>No students found.</p>
+            <?php endif; ?>
         </div>
+    </form>
+
+    <!-- Pagination -->
+    <?php if ($pages > 1): ?>
+    <div class="pagination">
+        <?php if ($page > 1): ?>
+            <a href="?page=1<?= !empty($search) ? '&search=' . urlencode($search) : '' ?>">« First</a>
+            <a href="?page=<?= $page - 1 ?><?= !empty($search) ? '&search=' . urlencode($search) : '' ?>">‹ Previous</a>
+        <?php endif; ?>
+        
+        <?php for ($i = max(1, $page - 2); $i <= min($pages, $page + 2); $i++): ?>
+            <?php if ($i == $page): ?>
+                <span class="active"><?= $i ?></span>
+            <?php else: ?>
+                <a href="?page=<?= $i ?><?= !empty($search) ? '&search=' . urlencode($search) : '' ?>"><?= $i ?></a>
+            <?php endif; ?>
+        <?php endfor; ?>
+        
+        <?php if ($page < $pages): ?>
+            <a href="?page=<?= $page + 1 ?><?= !empty($search) ? '&search=' . urlencode($search) : '' ?>">Next ›</a>
+            <a href="?page=<?= $pages ?><?= !empty($search) ? '&search=' . urlencode($search) : '' ?>">Last »</a>
+        <?php endif; ?>
+    </div>
     <?php endif; ?>
 
-    <div class="auth-links">
-        <a href="dashboard.php">Back to Dashboard</a>
+    <div class="back-link">
+        <a href="dashboard.php" class="btn btn-primary">← Back to Dashboard</a>
     </div>
 </div>
+
+<script>
+function toggleAll(source) {
+    const checkboxes = document.querySelectorAll('.student-checkbox');
+    checkboxes.forEach(cb => cb.checked = source.checked);
+    updateSelectedCount();
+}
+
+function selectAll() {
+    const checkboxes = document.querySelectorAll('.student-checkbox');
+    checkboxes.forEach(cb => cb.checked = true);
+    document.getElementById('selectAll').checked = true;
+    updateSelectedCount();
+}
+
+function deselectAll() {
+    const checkboxes = document.querySelectorAll('.student-checkbox');
+    checkboxes.forEach(cb => cb.checked = false);
+    document.getElementById('selectAll').checked = false;
+    updateSelectedCount();
+}
+
+function updateSelectedCount() {
+    const checkboxes = document.querySelectorAll('.student-checkbox:checked');
+    document.getElementById('selectedCount').textContent = checkboxes.length;
+}
+
+document.querySelectorAll('.student-checkbox').forEach(cb => {
+    cb.addEventListener('change', updateSelectedCount);
+});
+</script>
 
 </body>
 </html>

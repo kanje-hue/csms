@@ -1,104 +1,204 @@
 <?php
+/**
+ * admin/login.php - Secure Admin Login
+ */
+
 session_start();
-include '../config/db.php';
+require_once '../config/db.php';
+require_once '../config/security.php';
+require_once '../config/security_base.php';
 
-$message = '';
+$security = new SecurityManager($conn);
+$error = '';
 
-if($_SERVER['REQUEST_METHOD'] === 'POST'){
-    $email = trim($_POST['email'] ?? '');
-    $password = trim($_POST['password'] ?? '');
-    
-    if(empty($email) || empty($password)){
-        $message = "❌ Please fill in all fields";
-    } else {
-        $stmt = $conn->prepare("SELECT admin_id, name, email FROM admins WHERE email = ? AND password = ? AND deleted = 0");
-        $stmt->bind_param("ss", $email, $password);
-        $stmt->execute();
-        $result = $stmt->get_result();
-        
-        if($result->num_rows > 0){
-            $admin = $result->fetch_assoc();
-            $_SESSION['admin_logged_in'] = true;
-            $_SESSION['admin_id'] = $admin['admin_id'];
-            $_SESSION['admin_name'] = $admin['name'];
-            $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-            
-            header("Location: manage_courses.php");
-            exit();
-        } else {
-            $message = "❌ Invalid email or password";
-        }
-        $stmt->close();
+// Rate limiting
+$ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+
+// Check rate limit - FIXED: Check if function exists
+if (function_exists('checkRateLimit')) {
+    if (!checkRateLimit($conn, $ip, 'admin_login', 5, 15)) {
+        die('<div style="color: red; text-align: center; padding: 50px; font-family: Arial;">🔒 Too many login attempts. Please try again later.</div>');
+    }
+} else {
+    // Fallback to SecurityManager method
+    if (!$security->checkRateLimit($ip, 'admin_login')) {
+        die('<div style="color: red; text-align: center; padding: 50px; font-family: Arial;">🔒 Too many login attempts. Please try again later.</div>');
     }
 }
 
-?>
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // CSRF Protection - FIXED: Check if token exists
+    $csrf_token = $_POST['csrf_token'] ?? '';
+    if (!isset($_SESSION['csrf_token']) || $csrf_token !== $_SESSION['csrf_token']) {
+        $error = "Security token verification failed";
+    } else {
+        $email = filter_var(trim($_POST['email'] ?? ''), FILTER_SANITIZE_EMAIL);
+        $password = $_POST['password'] ?? '';
+        
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $error = "Invalid email format";
+        } elseif (empty($password)) {
+            $error = "Password is required";
+        } else {
+            // Get admin from database
+            $stmt = $conn->prepare("SELECT admin_id, name, email, password FROM admins WHERE email = ? AND deleted = 0");
+            if ($stmt) {
+                $stmt->bind_param("s", $email);
+                $stmt->execute();
+                $result = $stmt->get_result();
+                
+                if ($result->num_rows > 0) {
+                    $admin = $result->fetch_assoc();
+                    
+                    // Verify password
+                    if (password_verify($password, $admin['password'])) {
+                        // Check if password needs rehash
+                        if (password_needs_rehash($admin['password'], PASSWORD_DEFAULT)) {
+                            $new_hash = password_hash($password, PASSWORD_DEFAULT);
+                            $update = $conn->prepare("UPDATE admins SET password = ? WHERE admin_id = ?");
+                            if ($update) {
+                                $update->bind_param("si", $new_hash, $admin['admin_id']);
+                                $update->execute();
+                                $update->close();
+                            }
+                        }
+                        
+                        // Successful login
+                        session_regenerate_id(true);
+                        $_SESSION['admin_logged_in'] = true;
+                        $_SESSION['admin_id'] = $admin['admin_id'];
+                        $_SESSION['admin_name'] = $admin['name'];
+                        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+                        $_SESSION['last_activity'] = time();
+                        
+                        // Clear rate limits
+                        if (function_exists('clearRateLimit')) {
+                            clearRateLimit($conn, $ip, 'admin_login');
+                        }
+                        
+                        header("Location: dashboard.php");
+                        exit();
+                    } else {
+                        // Failed login - record attempt
+                        if (function_exists('recordRateLimit')) {
+                            recordRateLimit($conn, $ip, 'admin_login');
+                        } else {
+                            $security->recordRateLimit($ip, 'admin_login');
+                        }
+                        $error = "❌ Invalid email or password";
+                    }
+                } else {
+                    // No user found
+                    if (function_exists('recordRateLimit')) {
+                        recordRateLimit($conn, $ip, 'admin_login');
+                    } else {
+                        $security->recordRateLimit($ip, 'admin_login');
+                    }
+                    $error = "❌ Invalid email or password";
+                }
+                $stmt->close();
+            } else {
+                $error = "Database error: " . $conn->error;
+            }
+        }
+    }
+}
 
+// Generate CSRF token
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+?>
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Admin Login - CSMS</title>
-    <link rel="stylesheet" href="../assets/css/auth.css">
     <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
         body {
-            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #0f172a, #1e293b);
+            min-height: 100vh;
             display: flex;
             align-items: center;
             justify-content: center;
-            min-height: 100vh;
             padding: 20px;
         }
 
-        .auth-card {
-            background: white;
+        .login-container {
             width: 100%;
-            max-width: 500px;
-            padding: 40px 30px;
-            border-radius: 12px;
-            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
+            max-width: 450px;
         }
 
-        h2 {
-            text-align: center;
-            color: #1a1a2e;
-            margin-bottom: 10px;
-            font-size: 24px;
+        .login-card {
+            background: white;
+            border-radius: 24px;
+            padding: 40px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
         }
 
-        .subtitle {
+        .login-header {
             text-align: center;
-            color: #7f8c8d;
             margin-bottom: 30px;
-            font-size: 13px;
+        }
+
+        .login-header h1 {
+            font-size: 2rem;
+            color: #0f172a;
+            margin-bottom: 8px;
+        }
+
+        .login-header h1 span {
+            color: #2dd4bf;
+        }
+
+        .login-header p {
+            color: #64748b;
+            font-size: 0.95rem;
+        }
+
+        .alert {
+            background: #fee2e2;
+            color: #991b1b;
+            padding: 12px 16px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            font-size: 0.9rem;
+            border-left: 4px solid #ef4444;
         }
 
         .form-group {
             margin-bottom: 20px;
         }
 
-        label {
+        .form-group label {
             display: block;
-            margin-bottom: 8px;
             font-weight: 600;
-            color: #2c3e50;
-            font-size: 13px;
+            margin-bottom: 8px;
+            color: #0f172a;
+            font-size: 0.9rem;
         }
 
-        input[type="email"],
-        input[type="password"] {
+        .form-group input {
             width: 100%;
-            padding: 12px 15px;
-            border: 2px solid #ecf0f1;
-            border-radius: 6px;
-            font-size: 14px;
+            padding: 14px 16px;
+            border: 2px solid #e2e8f0;
+            border-radius: 12px;
+            font-size: 1rem;
             transition: all 0.3s;
         }
 
-        input[type="email"]:focus,
-        input[type="password"]:focus {
+        .form-group input:focus {
             outline: none;
-            border-color: #16a085;
-            box-shadow: 0 0 0 3px rgba(22, 160, 133, 0.1);
+            border-color: #2dd4bf;
+            box-shadow: 0 0 0 4px rgba(45, 212, 191, 0.1);
         }
 
         .password-group {
@@ -107,125 +207,103 @@ if($_SERVER['REQUEST_METHOD'] === 'POST'){
 
         .password-toggle {
             position: absolute;
-            right: 12px;
-            top: 40px;
+            right: 16px;
+            top: 45px;
             background: none;
             border: none;
-            color: #16a085;
+            color: #2dd4bf;
             cursor: pointer;
-            font-size: 12px;
-            font-weight: 600;
-            padding: 0;
-        }
-
-        .checkbox-group {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            margin-bottom: 20px;
-            font-size: 13px;
-        }
-
-        .checkbox-group a {
-            color: #16a085;
-            text-decoration: none;
+            font-size: 0.9rem;
             font-weight: 600;
         }
 
-        button {
+        .btn {
             width: 100%;
-            padding: 12px;
-            background: linear-gradient(135deg, #16a085, #117a65);
+            padding: 14px;
+            background: linear-gradient(135deg, #2dd4bf, #14b8a6);
             color: white;
             border: none;
-            border-radius: 6px;
+            border-radius: 12px;
+            font-size: 1rem;
             font-weight: 600;
             cursor: pointer;
-            font-size: 14px;
             transition: all 0.3s;
         }
 
-        button:hover {
+        .btn:hover {
             transform: translateY(-2px);
-            box-shadow: 0 8px 16px rgba(22, 160, 133, 0.3);
+            box-shadow: 0 10px 20px -5px rgba(45, 212, 191, 0.4);
         }
 
-        .message {
-            background: #fadbd8;
-            color: #c0392b;
-            padding: 12px 15px;
-            border-radius: 6px;
-            margin-bottom: 20px;
-            font-size: 13px;
-            border-left: 4px solid #c0392b;
-        }
-
-        .back-link {
+        .login-footer {
             text-align: center;
-            margin-top: 20px;
+            margin-top: 25px;
         }
 
-        .back-link a {
-            color: #16a085;
+        .login-footer a {
+            color: #64748b;
             text-decoration: none;
-            font-weight: 600;
-            font-size: 13px;
+            font-size: 0.9rem;
         }
 
-        .back-link a:hover {
-            text-decoration: underline;
+        .login-footer a:hover {
+            color: #2dd4bf;
+        }
+
+        @media (max-width: 768px) {
+            .login-card {
+                padding: 30px 20px;
+            }
         }
     </style>
 </head>
 <body>
+    <div class="login-container">
+        <div class="login-card">
+            <div class="login-header">
+                <h1>CSMS <span>Admin</span></h1>
+                <p>Sign in to manage your system</p>
+            </div>
 
-<div class="auth-card">
-    <h2>🏢 Admin Login</h2>
-    <p class="subtitle">Manage courses, modules, and students</p>
+            <?php if ($error): ?>
+                <div class="alert"><?= htmlspecialchars($error) ?></div>
+            <?php endif; ?>
 
-    <?php if($message): ?>
-        <div class="message"><?= htmlspecialchars($message) ?></div>
-    <?php endif; ?>
+            <form method="POST">
+                <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
 
-    <form method="POST">
-        <div class="form-group">
-            <label>Email Address</label>
-            <input type="email" name="email" placeholder="Enter your email" required>
+                <div class="form-group">
+                    <label for="email">Email Address</label>
+                    <input type="email" id="email" name="email" value="admin@csms.com" placeholder="admin@csms.com" required>
+                </div>
+
+                <div class="form-group password-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" name="password" placeholder="Enter your password" required>
+                    <button type="button" class="password-toggle" onclick="togglePassword()">Show</button>
+                </div>
+
+                <button type="submit" class="btn">Sign In</button>
+            </form>
+
+            <div class="login-footer">
+                <a href="../public/">← Back to Unified Login</a>
+            </div>
         </div>
-
-        <div class="form-group password-group">
-            <label>Password</label>
-            <input type="password" name="password" id="admin-password" placeholder="Enter your password" required>
-            <button type="button" class="password-toggle" onclick="toggleAdminPassword()">Show</button>
-        </div>
-
-        <div class="checkbox-group">
-            <label style="margin-bottom: 0;">
-                <input type="checkbox" name="remember"> Remember me
-            </label>
-            <a href="#">Forgot password?</a>
-        </div>
-
-        <button type="submit">Continue</button>
-    </form>
-
-    <div class="back-link">
-        <a href="../index.php">← Back to Login Page</a>
     </div>
-</div>
 
-<script>
-    function toggleAdminPassword() {
-        const passwordField = document.getElementById('admin-password');
-        if (passwordField.type === 'password') {
-            passwordField.type = 'text';
-            event.target.textContent = 'Hide';
-        } else {
-            passwordField.type = 'password';
-            event.target.textContent = 'Show';
+    <script>
+        function togglePassword() {
+            const password = document.getElementById('password');
+            const toggle = event.target;
+            if (password.type === 'password') {
+                password.type = 'text';
+                toggle.textContent = 'Hide';
+            } else {
+                password.type = 'password';
+                toggle.textContent = 'Show';
+            }
         }
-    }
-</script>
-
+    </script>
 </body>
 </html>

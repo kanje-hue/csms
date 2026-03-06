@@ -1,67 +1,57 @@
 <?php
 /**
- * teacher/change_password.php - Change Teacher Password
+ * teacher/first_login.php - Force Password Change on First Login
+ * Teachers redirected here when force_password_change = 1
  */
 
 session_start();
 require_once '../config/db.php';
-require_once '../config/security.php';
+require_once '../config/security.php';  // Add this line
 
-// Check teacher login
-if (!isset($_SESSION['teacher_logged_in']) || !isset($_SESSION['teacher_id'])) {
+$security = new SecurityManager($conn);
+
+// Check if teacher is in temp session
+if (!isset($_SESSION['temp_teacher_id']) || !isset($_SESSION['temp_teacher_email'])) {
     header("Location: login.php");
     exit();
 }
 
-$security = new SecurityManager($conn);
-$teacher_id = $_SESSION['teacher_id'];
-$teacher_name = $_SESSION['teacher_name'] ?? 'Teacher';
+$teacher_id = $_SESSION['temp_teacher_id'];
+$email = $_SESSION['temp_teacher_email'];
+$name = $_SESSION['temp_teacher_name'] ?? 'Teacher';
+$error = "";
+$success = "";
 
-$message = "";
-$message_type = "";
-$csrf_token = $security->generateCSRFToken();
-
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['change_password'])) {
-    if (!$security->validateCSRFToken($_POST['csrf_token'] ?? '')) {
-        $message = "Security token verification failed";
-        $message_type = "error";
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $password = $_POST['password'] ?? '';
+    $confirm = $_POST['confirm_password'] ?? '';
+    
+    if ($password !== $confirm) {
+        $error = "Passwords do not match!";
     } else {
-        $current = $_POST['current_password'] ?? '';
-        $new = $_POST['new_password'] ?? '';
-        $confirm = $_POST['confirm_password'] ?? '';
-        
-        // Get current password from DB
-        $stmt = $conn->prepare("SELECT password FROM teachers WHERE teacher_id = ?");
-        $stmt->bind_param("i", $teacher_id);
-        $stmt->execute();
-        $result = $stmt->get_result();
-        $teacher = $result->fetch_assoc();
-        $stmt->close();
-        
-        // Verify current password
-        if (!password_verify($current, $teacher['password'])) {
-            $message = "Current password is incorrect";
-            $message_type = "error";
-        } elseif ($new !== $confirm) {
-            $message = "New passwords do not match";
-            $message_type = "error";
+        // Validate password strength
+        $strength = $security->validatePasswordStrength($password);
+        if (!$strength['valid']) {
+            $error = $strength['message'];
         } else {
-            // Validate new password strength
-            $strength = $security->validatePasswordStrength($new);
-            if (!$strength['valid']) {
-                $message = $strength['message'];
-                $message_type = "error";
-            } elseif ($security->checkPasswordHistory('teachers', $teacher_id, $new)) {
-                $message = "You cannot reuse one of your last 5 passwords";
-                $message_type = "error";
+            // Check password history
+            if ($security->checkPasswordHistory('teachers', $teacher_id, $password)) {
+                $error = "You cannot reuse one of your last 5 passwords!";
             } else {
-                // Update password
-                if ($security->updatePassword('teachers', $teacher_id, $new)) {
-                    $message = "✓ Password changed successfully!";
-                    $message_type = "success";
+                // Update password and remove force flag
+                if ($security->updatePassword('teachers', $teacher_id, $password)) {
+                    // Clear temp session and set permanent session
+                    unset($_SESSION['temp_teacher_id'], $_SESSION['temp_teacher_email'], $_SESSION['temp_teacher_name']);
+                    
+                    $_SESSION['teacher_logged_in'] = true;
+                    $_SESSION['teacher_id'] = $teacher_id;
+                    $_SESSION['teacher_name'] = $name;
+                    $_SESSION['last_activity'] = time();
+                    
+                    $success = "Password changed successfully! Redirecting...";
+                    header("refresh:2;url=dashboard.php");
                 } else {
-                    $message = "Error changing password";
-                    $message_type = "error";
+                    $error = "Failed to update password!";
                 }
             }
         }
@@ -73,7 +63,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['change_password'])) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Change Password - CSMS Teacher</title>
+    <title>First Login - Change Password</title>
     <style>
         * {
             margin: 0;
@@ -130,16 +120,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['change_password'])) {
             font-size: 0.9rem;
         }
 
-        .alert.success {
-            background: #d1fae5;
-            color: #065f46;
-            border-left: 4px solid #10b981;
-        }
-
         .alert.error {
             background: #fee2e2;
             color: #991b1b;
             border-left: 4px solid #ef4444;
+        }
+
+        .alert.success {
+            background: #d1fae5;
+            color: #065f46;
+            border-left: 4px solid #10b981;
         }
 
         .info-box {
@@ -151,7 +141,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['change_password'])) {
         }
 
         .info-box p {
+            margin-bottom: 5px;
             color: #0f172a;
+        }
+
+        .info-box strong {
+            color: #2dd4bf;
         }
 
         .form-group {
@@ -181,20 +176,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['change_password'])) {
             box-shadow: 0 0 0 4px rgba(45, 212, 191, 0.1);
         }
 
-        .password-requirements {
-            background: #f8fafc;
-            border-radius: 12px;
-            padding: 15px;
-            margin: 20px 0;
-        }
-
-        .requirement {
+        .hint {
+            font-size: 0.8rem;
             color: #64748b;
-            font-size: 0.85rem;
-            margin: 5px 0;
-            display: flex;
-            align-items: center;
-            gap: 8px;
+            margin-top: 6px;
         }
 
         .btn {
@@ -216,15 +201,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['change_password'])) {
             box-shadow: 0 10px 20px -5px rgba(45, 212, 191, 0.4);
         }
 
-        .btn-secondary {
-            background: #e2e8f0;
-            color: #0f172a;
-            margin-top: 10px;
+        .password-requirements {
+            background: #f8fafc;
+            border-radius: 12px;
+            padding: 15px;
+            margin: 20px 0;
         }
 
-        .btn-secondary:hover {
-            background: #cbd5e1;
-            transform: translateY(-2px);
+        .requirement {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #64748b;
+            font-size: 0.85rem;
+            margin: 5px 0;
         }
 
         .footer {
@@ -248,33 +238,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['change_password'])) {
         <div class="card">
             <div class="header">
                 <h1>CSMS <span>Teacher</span></h1>
-                <p>Change Your Password</p>
+                <p>First Time Login - Change Your Password</p>
             </div>
 
-            <?php if ($message): ?>
-                <div class="alert <?= $message_type ?>"><?= $message ?></div>
+            <?php if ($error): ?>
+                <div class="alert error"><?= $error ?></div>
+            <?php endif; ?>
+
+            <?php if ($success): ?>
+                <div class="alert success"><?= $success ?></div>
             <?php endif; ?>
 
             <div class="info-box">
-                <p><strong><?= htmlspecialchars($teacher_name) ?></strong>, you can change your password here.</p>
+                <p><strong>Welcome, <?= htmlspecialchars($name) ?>!</strong></p>
+                <p>This is your first login. Please set a new password to continue.</p>
+                <p style="margin-top: 8px;">📧 <?= htmlspecialchars($email) ?></p>
             </div>
 
             <form method="POST">
-                <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
-
                 <div class="form-group">
-                    <label for="current">Current Password</label>
-                    <input type="password" id="current" name="current_password" required placeholder="Enter current password">
+                    <label for="password">New Password</label>
+                    <input type="password" id="password" name="password" required placeholder="Enter new password">
+                    <div class="hint">Must be at least 8 characters</div>
                 </div>
 
                 <div class="form-group">
-                    <label for="new">New Password</label>
-                    <input type="password" id="new" name="new_password" required placeholder="Enter new password">
-                </div>
-
-                <div class="form-group">
-                    <label for="confirm">Confirm New Password</label>
-                    <input type="password" id="confirm" name="confirm_password" required placeholder="Re-enter new password">
+                    <label for="confirm_password">Confirm Password</label>
+                    <input type="password" id="confirm_password" name="confirm_password" required placeholder="Re-enter password">
                 </div>
 
                 <div class="password-requirements">
@@ -285,12 +275,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['change_password'])) {
                     <div class="requirement">✓ One special character (!@#$%^&*)</div>
                 </div>
 
-                <button type="submit" name="change_password" class="btn">Update Password</button>
-                <a href="dashboard.php" class="btn btn-secondary">Cancel</a>
+                <button type="submit" class="btn">Change Password & Continue</button>
             </form>
 
             <div class="footer">
-                <a href="dashboard.php">← Back to Dashboard</a>
+                <a href="logout.php">← Cancel and Logout</a>
             </div>
         </div>
     </div>

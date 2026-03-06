@@ -1,681 +1,329 @@
 <?php
-session_start();
+/**
+ * admin/recycle_teachers.php - Restore or Permanently Delete Teachers
+ */
 
-// If already logged in, redirect to appropriate dashboard
-if(isset($_SESSION['admin_logged_in'])){
-    header("Location: admin/manage_courses.php");
-    exit();
-} elseif(isset($_SESSION['teacher_logged_in'])){
-    header("Location: teacher/dashboard.php");
-    exit();
-} elseif(isset($_SESSION['student_id'])){
-    header("Location: student/dashboard.php");
-    exit();
+session_start();
+require_once '../config/db.php';
+require_once '../config/security_base.php';
+
+// Check admin login
+checkAdminSession();
+
+$message = "";
+$message_type = "";
+
+// Handle restore
+if (isset($_GET['action']) && $_GET['action'] === 'restore' && isset($_GET['id'])) {
+    $id = (int)$_GET['id'];
+    
+    $stmt = $conn->prepare("UPDATE teachers SET deleted = 0, deleted_at = NULL WHERE teacher_id = ?");
+    $stmt->bind_param("i", $id);
+    
+    if ($stmt->execute()) {
+        $message = "Teacher restored successfully";
+        $message_type = "success";
+        
+        logAdminAction($conn, $_SESSION['admin_id'], 'restore_teacher', "Restored teacher ID: $id");
+    }
+    $stmt->close();
 }
 
-// Determine current tab
-$current_tab = isset($_GET['tab']) ? $_GET['tab'] : 'login';
+// Handle permanent delete
+if (isset($_GET['action']) && $_GET['action'] === 'permanent' && isset($_GET['id'])) {
+    $id = (int)$_GET['id'];
+    
+    $stmt = $conn->prepare("DELETE FROM teachers WHERE teacher_id = ?");
+    $stmt->bind_param("i", $id);
+    
+    if ($stmt->execute()) {
+        $message = "Teacher permanently deleted";
+        $message_type = "success";
+        
+        logAdminAction($conn, $_SESSION['admin_id'], 'permanent_delete_teacher', "Permanently deleted teacher ID: $id");
+    }
+    $stmt->close();
+}
 
+// Get deleted teachers - FIXED: Check if deleted_at column exists
+$check_column = $conn->query("SHOW COLUMNS FROM teachers LIKE 'deleted_at'");
+$has_deleted_at = $check_column->num_rows > 0;
+
+if ($has_deleted_at) {
+    // Use deleted_at if it exists
+    $teachers = $conn->query("
+        SELECT teacher_id, fullname, email, status, force_password_change, created_at, deleted_at 
+        FROM teachers 
+        WHERE deleted = 1 
+        ORDER BY deleted_at DESC
+    ")->fetch_all(MYSQLI_ASSOC);
+} else {
+    // Fallback to created_at if deleted_at doesn't exist
+    $teachers = $conn->query("
+        SELECT teacher_id, fullname, email, status, force_password_change, created_at 
+        FROM teachers 
+        WHERE deleted = 1 
+        ORDER BY created_at DESC
+    ")->fetch_all(MYSQLI_ASSOC);
+}
 ?>
-
 <!DOCTYPE html>
 <html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CSMS - Course Student Management System</title>
+    <title>Recycle Bin - Teachers</title>
+    <link rel="stylesheet" href="../assets/css/auth.css">
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-                'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f5f7fa;
         }
-
-        .container {
-            width: 100%;
-            max-width: 600px;
-        }
-
-        .card {
-            background: white;
-            border-radius: 12px;
-            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
-            overflow: hidden;
-        }
-
-        .card-header {
+        
+        .header {
             background: linear-gradient(135deg, #1a1a2e, #16213e);
             color: white;
-            padding: 40px 20px;
-            text-align: center;
-        }
-
-        .logo {
-            font-size: 36px;
-            font-weight: bold;
-            margin-bottom: 10px;
-            letter-spacing: 2px;
-        }
-
-        .logo-text {
-            color: white;
-        }
-
-        .logo-accent {
-            color: #16a085;
-        }
-
-        .card-header h2 {
-            font-size: 24px;
-            margin-bottom: 10px;
-            font-weight: 600;
-        }
-
-        .card-header p {
-            font-size: 13px;
-            opacity: 0.9;
-            line-height: 1.6;
-            color: #bdc3c7;
-        }
-
-        .card-body {
-            padding: 40px 30px;
-        }
-
-        /* Tabs */
-        .tabs {
+            padding: 20px 30px;
             display: flex;
-            border-bottom: 2px solid #ecf0f1;
-            margin-bottom: 30px;
-            gap: 0;
-        }
-
-        .tab-btn {
-            flex: 1;
-            padding: 15px;
-            border: none;
-            background: none;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: 600;
-            color: #95a5a6;
-            transition: all 0.3s;
-            border-bottom: 3px solid transparent;
-            margin-bottom: -2px;
-        }
-
-        .tab-btn:hover {
-            color: #16a085;
-            background: #ecf0f1;
-        }
-
-        .tab-btn.active {
-            color: #16a085;
-            border-bottom-color: #16a085;
-            background: #f8fafb;
-        }
-
-        .tab-content {
-            display: none;
-        }
-
-        .tab-content.active {
-            display: block;
-            animation: fadeIn 0.3s ease-in;
-        }
-
-        @keyframes fadeIn {
-            from { opacity: 0; }
-            to { opacity: 1; }
-        }
-
-        /* Role Selection */
-        .role-selector {
-            display: grid;
-            grid-template-columns: 1fr 1fr 1fr;
-            gap: 15px;
-            margin-bottom: 30px;
-        }
-
-        .role-option {
-            padding: 20px;
-            border: 2px solid #ecf0f1;
-            border-radius: 8px;
-            cursor: pointer;
-            text-align: center;
-            transition: all 0.3s;
-        }
-
-        .role-option:hover {
-            border-color: #16a085;
-            background: #f8fafb;
-        }
-
-        .role-option.selected {
-            border-color: #16a085;
-            background: #e8f8f5;
-            box-shadow: 0 4px 12px rgba(22, 160, 133, 0.2);
-        }
-
-        .role-icon {
-            font-size: 32px;
-            margin-bottom: 8px;
-        }
-
-        .role-label {
-            font-size: 12px;
-            font-weight: 600;
-            color: #2c3e50;
-        }
-
-        .hidden-role {
-            display: none;
-        }
-
-        /* Form Groups */
-        .form-group {
-            margin-bottom: 20px;
-        }
-
-        label {
-            display: block;
-            margin-bottom: 8px;
-            font-size: 13px;
-            font-weight: 600;
-            color: #2c3e50;
-        }
-
-        input[type="email"],
-        input[type="password"],
-        input[type="text"],
-        select {
-            width: 100%;
-            padding: 12px 15px;
-            border: 2px solid #ecf0f1;
-            border-radius: 6px;
-            font-size: 14px;
-            transition: all 0.3s;
-            font-family: inherit;
-        }
-
-        input[type="email"]:focus,
-        input[type="password"]:focus,
-        input[type="text"]:focus,
-        select:focus {
-            outline: none;
-            border-color: #16a085;
-            box-shadow: 0 0 0 3px rgba(22, 160, 133, 0.1);
-            background: #f8fafb;
-        }
-
-        input::placeholder {
-            color: #95a5a6;
-        }
-
-        /* Checkbox */
-        .checkbox-group {
-            display: flex;
+            justify-content: space-between;
             align-items: center;
-            gap: 8px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 30px auto;
+            padding: 0 20px;
+        }
+        
+        .breadcrumb {
+            background: white;
+            padding: 15px 20px;
+            border-radius: 8px;
             margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }
-
-        input[type="checkbox"] {
-            width: 16px;
-            height: 16px;
-            cursor: pointer;
-            accent-color: #16a085;
-        }
-
-        .checkbox-group label {
-            margin-bottom: 0;
-            font-size: 13px;
-            font-weight: 400;
-            cursor: pointer;
-        }
-
-        /* Links */
-        .forgot-password {
-            text-align: right;
-            margin-bottom: 20px;
-        }
-
-        .forgot-password a {
-            font-size: 12px;
+        
+        .breadcrumb a {
             color: #16a085;
             text-decoration: none;
-            font-weight: 600;
         }
-
-        .forgot-password a:hover {
-            text-decoration: underline;
+        
+        .page-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
         }
-
-        /* Buttons */
+        
+        .page-header h1 {
+            color: #1a1a2e;
+            font-size: 24px;
+        }
+        
         .btn {
-            width: 100%;
-            padding: 12px;
+            padding: 10px 20px;
             border: none;
             border-radius: 6px;
-            font-size: 14px;
-            font-weight: 600;
             cursor: pointer;
-            transition: all 0.3s;
+            font-weight: bold;
             text-decoration: none;
             display: inline-block;
-            text-align: center;
         }
-
+        
         .btn-primary {
-            background: linear-gradient(135deg, #16a085, #117a65);
+            background: #16a085;
             color: white;
         }
-
-        .btn-primary:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 16px rgba(22, 160, 133, 0.3);
+        
+        .btn-success {
+            background: #27ae60;
+            color: white;
         }
-
-        .btn-primary:active {
-            transform: translateY(0);
+        
+        .btn-danger {
+            background: #e74c3c;
+            color: white;
         }
-
-        .btn-secondary {
-            background: #ecf0f1;
-            color: #2c3e50;
-            margin-top: 10px;
-        }
-
-        .btn-secondary:hover {
-            background: #d5dbdb;
-        }
-
-        /* Footer Links */
-        .card-footer {
-            text-align: center;
-            padding: 20px;
-            background: #f8fafb;
-            border-top: 1px solid #ecf0f1;
-        }
-
-        .card-footer p {
-            font-size: 13px;
-            color: #7f8c8d;
-        }
-
-        .card-footer a {
-            color: #16a085;
-            text-decoration: none;
-            font-weight: 600;
-        }
-
-        .card-footer a:hover {
-            text-decoration: underline;
-        }
-
-        .toggle-link {
-            margin-top: 15px;
-        }
-
-        .toggle-link a {
-            cursor: pointer;
-        }
-
-        /* Alert Messages */
+        
         .alert {
-            padding: 12px 15px;
-            border-radius: 6px;
+            padding: 15px;
+            border-radius: 8px;
             margin-bottom: 20px;
-            font-size: 13px;
-            display: none;
         }
-
-        .alert.error {
-            background: #fadbd8;
-            color: #c0392b;
-            border-left: 4px solid #c0392b;
-            display: block;
-        }
-
+        
         .alert.success {
-            background: #d5f4e6;
-            color: #27ae60;
-            border-left: 4px solid #27ae60;
-            display: block;
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
         }
-
-        /* Responsive */
-        @media (max-width: 600px) {
-            .card-header {
-                padding: 30px 15px;
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+        }
+        
+        th {
+            background: #f8f9fa;
+            padding: 15px;
+            text-align: left;
+            font-weight: bold;
+            color: #555;
+        }
+        
+        td {
+            padding: 15px;
+            border-bottom: 1px solid #eee;
+        }
+        
+        tr:hover {
+            background: #f8f9fa;
+        }
+        
+        .teacher-name {
+            font-weight: bold;
+            color: #1a1a2e;
+        }
+        
+        .deleted-date {
+            font-size: 12px;
+            color: #666;
+        }
+        
+        .action-buttons {
+            display: flex;
+            gap: 8px;
+        }
+        
+        .action-btn {
+            padding: 6px 12px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 12px;
+            text-decoration: none;
+            display: inline-block;
+        }
+        
+        .btn-restore {
+            background: #d4edda;
+            color: #155724;
+        }
+        
+        .btn-delete {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 60px;
+            background: white;
+            border-radius: 12px;
+        }
+        
+        .empty-state p {
+            color: #666;
+            margin-bottom: 20px;
+        }
+        
+        @media (max-width: 768px) {
+            table {
+                font-size: 12px;
             }
-
-            .card-body {
-                padding: 25px 15px;
+            
+            td, th {
+                padding: 10px;
             }
-
-            .role-selector {
-                grid-template-columns: 1fr;
-            }
-
-            .logo {
-                font-size: 28px;
-            }
-
-            .card-header h2 {
-                font-size: 20px;
+            
+            .action-buttons {
+                flex-direction: column;
             }
         }
     </style>
 </head>
 <body>
 
-<div class="container">
-    <div class="card">
-        <!-- Header -->
-        <div class="card-header">
-            <div class="logo">
-                <span class="logo-text">CSMS</span><span class="logo-accent">Pro</span>
-            </div>
-            <h2 id="card-title">Login to Your Account</h2>
-            <p>Manage your accounts and access insightful reports and technical analysis among many more features.</p>
-        </div>
-
-        <!-- Body -->
-        <div class="card-body">
-
-            <!-- Tabs -->
-            <div class="tabs">
-                <button class="tab-btn active" onclick="switchTab(event, 'login')">
-                    🔐 Login
-                </button>
-                <button class="tab-btn" onclick="switchTab(event, 'register')">
-                    📝 Register
-                </button>
-            </div>
-
-            <!-- LOGIN TAB -->
-            <div id="login" class="tab-content active">
-                
-                <!-- Role Selection -->
-                <label style="display: block; text-align: center; font-size: 14px; margin-bottom: 20px; font-weight: 600; color: #2c3e50;">Select Your Role:</label>
-                
-                <div class="role-selector">
-                    <div class="role-option selected" onclick="selectRole(this, 'admin')">
-                        <div class="role-icon">👨‍💼</div>
-                        <div class="role-label">Admin</div>
-                    </div>
-                    <div class="role-option" onclick="selectRole(this, 'teacher')">
-                        <div class="role-icon">👨‍🏫</div>
-                        <div class="role-label">Teacher</div>
-                    </div>
-                    <div class="role-option" onclick="selectRole(this, 'student')">
-                        <div class="role-icon">👨‍🎓</div>
-                        <div class="role-label">Student</div>
-                    </div>
-                </div>
-
-                <!-- Login Form -->
-                <form id="login-form" method="POST" action="">
-                    <input type="hidden" id="selected-role" name="role" value="admin">
-                    
-                    <div id="alert-container"></div>
-
-                    <div class="form-group">
-                        <label>Email Address</label>
-                        <input type="email" name="email" placeholder="Enter your email" required>
-                    </div>
-
-                    <div class="form-group">
-                        <label>Password</label>
-                        <input type="password" name="password" placeholder="Enter your password" required>
-                    </div>
-
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                        <div class="checkbox-group">
-                            <input type="checkbox" id="remember" name="remember">
-                            <label for="remember">Remember me</label>
-                        </div>
-                        <a href="#" class="forgot-password">Forgot password?</a>
-                    </div>
-
-                    <button type="submit" class="btn btn-primary">Continue</button>
-                </form>
-
-                <div style="text-align: center; margin-top: 15px;">
-                    <a href="#" onclick="switchTab(event, 'register'); return false;" style="color: #16a085; font-size: 13px; font-weight: 600;">
-                        Don't have an account? Create one
-                    </a>
-                </div>
-
-            </div>
-
-            <!-- REGISTER TAB -->
-            <div id="register" class="tab-content">
-                
-                <!-- Role Selection for Registration -->
-                <label style="display: block; text-align: center; font-size: 14px; margin-bottom: 20px; font-weight: 600; color: #2c3e50;">Select Your Role:</label>
-                
-                <div class="role-selector">
-                    <div class="role-option" onclick="selectRegisterRole(this, 'admin')">
-                        <div class="role-icon">👨‍💼</div>
-                        <div class="role-label">Admin</div>
-                    </div>
-                    <div class="role-option" onclick="selectRegisterRole(this, 'teacher')">
-                        <div class="role-icon">👨‍🏫</div>
-                        <div class="role-label">Teacher</div>
-                    </div>
-                    <div class="role-option selected" onclick="selectRegisterRole(this, 'student')">
-                        <div class="role-icon">👨‍🎓</div>
-                        <div class="role-label">Student</div>
-                    </div>
-                </div>
-
-                <!-- Registration Form -->
-                <form id="register-form" method="POST" action="">
-                    <input type="hidden" id="register-role" name="register_role" value="student">
-                    
-                    <div id="register-alert"></div>
-
-                    <div class="form-group">
-                        <label>Full Name</label>
-                        <input type="text" name="fullname" placeholder="Enter your full name" required>
-                    </div>
-
-                    <div class="form-group">
-                        <label>Email Address</label>
-                        <input type="email" name="email" placeholder="Enter your email" required>
-                    </div>
-
-                    <div class="form-group" id="student-reg-fields">
-                        <label>Registration Number</label>
-                        <input type="text" name="reg_number" placeholder="Enter registration number">
-                    </div>
-
-                    <div class="form-group" id="student-course-fields">
-                        <label>Select Course</label>
-                        <select name="course_id">
-                            <option value="">-- Select Course --</option>
-                            <?php
-                            include 'config/db.php';
-                            $courses = $conn->query("SELECT course_id, course_name FROM courses WHERE deleted = 0 ORDER BY course_name");
-                            while($course = $courses->fetch_assoc()){
-                                echo "<option value='{$course['course_id']}'>{$course['course_name']}</option>";
-                            }
-                            ?>
-                        </select>
-                    </div>
-
-                    <div class="form-group">
-                        <label>Password</label>
-                        <input type="password" name="password" placeholder="Create a password" required>
-                    </div>
-
-                    <div class="form-group">
-                        <label>Confirm Password</label>
-                        <input type="password" name="confirm_password" placeholder="Confirm your password" required>
-                    </div>
-
-                    <div class="checkbox-group">
-                        <input type="checkbox" id="agree" name="agree" required>
-                        <label for="agree">I agree to the Terms and Conditions</label>
-                    </div>
-
-                    <button type="submit" class="btn btn-primary">Create Account</button>
-                </form>
-
-                <div style="text-align: center; margin-top: 15px;">
-                    <a href="#" onclick="switchTab(event, 'login'); return false;" style="color: #16a085; font-size: 13px; font-weight: 600;">
-                        Already have an account? Login here
-                    </a>
-                </div>
-
-            </div>
-
-        </div>
-
-        <!-- Footer -->
-        <div class="card-footer">
-            <p>&copy; 2026 CSMS Pro. All rights reserved.</p>
-        </div>
-    </div>
+<div class="header">
+    <div style="font-size: 20px;">CSMS Admin</div>
+    <a href="logout.php" style="color: white; text-decoration: none;">🚪 Logout</a>
 </div>
 
-<script>
-    function switchTab(e, tabName) {
-        if(e) e.preventDefault();
-        
-        // Hide all tabs
-        const tabs = document.querySelectorAll('.tab-content');
-        tabs.forEach(tab => tab.classList.remove('active'));
-        
-        // Remove active from all buttons
-        const buttons = document.querySelectorAll('.tab-btn');
-        buttons.forEach(btn => btn.classList.remove('active'));
-        
-        // Show selected tab
-        document.getElementById(tabName).classList.add('active');
-        
-        // Add active to clicked button
-        event.target.classList.add('active');
-        
-        // Update title
-        const title = tabName === 'login' ? 'Login to Your Account' : 'Create Your Account';
-        document.getElementById('card-title').textContent = title;
-    }
+<div class="container">
+    <!-- Breadcrumb -->
+    <div class="breadcrumb">
+        <a href="dashboard.php">Dashboard</a> > 
+        <a href="manage_teachers.php">Teachers</a> > 
+        <strong>Recycle Bin</strong>
+    </div>
 
-    function selectRole(element, role) {
-        // Remove selected from all
-        document.querySelectorAll('.role-selector .role-option').forEach(el => {
-            el.classList.remove('selected');
-        });
-        
-        // Add selected to clicked
-        element.classList.add('selected');
-        
-        // Update hidden input
-        document.getElementById('selected-role').value = role;
-    }
+    <!-- Page Header -->
+    <div class="page-header">
+        <h1>🗑️ Teacher Recycle Bin</h1>
+        <a href="manage_teachers.php" class="btn btn-primary">← Back to Teachers</a>
+    </div>
 
-    function selectRegisterRole(element, role) {
-        // Remove selected from all
-        document.querySelectorAll('#register .role-selector .role-option').forEach(el => {
-            el.classList.remove('selected');
-        });
-        
-        // Add selected to clicked
-        element.classList.add('selected');
-        
-        // Update hidden input
-        document.getElementById('register-role').value = role;
-        
-        // Show/hide student-specific fields
-        const studentFields = document.getElementById('student-reg-fields');
-        const courseFields = document.getElementById('student-course-fields');
-        
-        if(role === 'student') {
-            studentFields.style.display = 'block';
-            courseFields.style.display = 'block';
-            document.querySelector('input[name="reg_number"]').required = true;
-            document.querySelector('select[name="course_id"]').required = true;
-        } else {
-            studentFields.style.display = 'none';
-            courseFields.style.display = 'none';
-            document.querySelector('input[name="reg_number"]').required = false;
-            document.querySelector('select[name="course_id"]').required = false;
-        }
-    }
+    <?php if ($message): ?>
+        <div class="alert <?= $message_type ?>"><?= $message ?></div>
+    <?php endif; ?>
 
-    // Form submission - redirect to appropriate login handler
-    document.getElementById('login-form').addEventListener('submit', function(e) {
-        e.preventDefault();
-        const role = document.getElementById('selected-role').value;
-        const formData = new FormData(this);
-        
-        // Redirect to appropriate login page
-        const loginPages = {
-            'admin': 'admin/login.php',
-            'teacher': 'teacher/login.php',
-            'student': 'student/login.php'
-        };
-        
-        // Create form and submit
-        const form = document.createElement('form');
-        form.method = 'POST';
-        form.action = loginPages[role];
-        
-        for(let [key, value] of formData) {
-            const input = document.createElement('input');
-            input.type = 'hidden';
-            input.name = key;
-            input.value = value;
-            form.appendChild(input);
-        }
-        
-        document.body.appendChild(form);
-        form.submit();
-    });
-
-    document.getElementById('register-form').addEventListener('submit', function(e) {
-        e.preventDefault();
-        const role = document.getElementById('register-role').value;
-        const formData = new FormData(this);
-        
-        // Redirect to appropriate registration page
-        const registerPages = {
-            'admin': 'admin/register.php',
-            'teacher': 'teacher/register.php',
-            'student': 'student/register.php'
-        };
-        
-        // Create form and submit
-        const form = document.createElement('form');
-        form.method = 'POST';
-        form.action = registerPages[role];
-        
-        for(let [key, value] of formData) {
-            const input = document.createElement('input');
-            input.type = 'hidden';
-            input.name = key;
-            input.value = value;
-            form.appendChild(input);
-        }
-        
-        document.body.appendChild(form);
-        form.submit();
-    });
-</script>
+    <!-- Teachers Table -->
+    <?php if (count($teachers) > 0): ?>
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Name</th>
+                <th>Email</th>
+                <th>Status</th>
+                <th>Deleted On</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            <?php foreach ($teachers as $teacher): ?>
+            <tr>
+                <td>#<?= $teacher['teacher_id'] ?></td>
+                <td><span class="teacher-name"><?= htmlspecialchars($teacher['fullname']) ?></span></td>
+                <td><?= htmlspecialchars($teacher['email']) ?></td>
+                <td>
+                    <?php if ($teacher['force_password_change']): ?>
+                        <span style="color: #e74c3c;">⚠️ Pending</span>
+                    <?php else: ?>
+                        <span style="color: #27ae60;">✓ Set</span>
+                    <?php endif; ?>
+                </td>
+                <td>
+                    <span class="deleted-date">
+                        <?php 
+                        if (isset($teacher['deleted_at']) && $teacher['deleted_at']) {
+                            echo date('M d, Y H:i', strtotime($teacher['deleted_at']));
+                        } else {
+                            echo date('M d, Y H:i', strtotime($teacher['created_at']));
+                        }
+                        ?>
+                    </span>
+                </td>
+                <td>
+                    <div class="action-buttons">
+                        <a href="?action=restore&id=<?= $teacher['teacher_id'] ?>" class="action-btn btn-restore" onclick="return confirm('Restore this teacher?')">↩️ Restore</a>
+                        <a href="?action=permanent&id=<?= $teacher['teacher_id'] ?>" class="action-btn btn-delete" onclick="return confirm('Permanently delete this teacher? This cannot be undone.')">🗑️ Delete</a>
+                    </div>
+                </td>
+            </tr>
+            <?php endforeach; ?>
+        </tbody>
+    </table>
+    <?php else: ?>
+    <div class="empty-state">
+        <p>🗑️ Recycle bin is empty</p>
+        <a href="manage_teachers.php" class="btn btn-primary">Back to Teachers</a>
+    </div>
+    <?php endif; ?>
+</div>
 
 </body>
 </html>
