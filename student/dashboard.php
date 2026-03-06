@@ -1,64 +1,46 @@
 <?php
-session_start();
-include '../config/db.php';
+/**
+ * student/dashboard.php - Student Dashboard
+ * Shows results from ALL years and semesters
+ */
 
-if(!isset($_SESSION['student_id'])){
-    header("Location: ../index.php");
+session_start();
+require_once '../config/db.php';
+require_once '../config/security_base.php';
+
+if (!isset($_SESSION['student_logged_in']) || !isset($_SESSION['student_id'])) {
+    header("Location: login.php");
     exit();
 }
 
-function safe_int($value) {
-    return filter_var($value, FILTER_VALIDATE_INT);
+// Session timeout (1 hour)
+if (isset($_SESSION['last_activity']) && (time() - $_SESSION['last_activity'] > 3600)) {
+    session_destroy();
+    header("Location: login.php?timeout=1");
+    exit();
 }
+$_SESSION['last_activity'] = time();
 
 $student_id = $_SESSION['student_id'];
 $student_name = $_SESSION['student_name'] ?? 'Student';
-$course_id = $_SESSION['course_id'] ?? null;
 
 // Get student info
-$student_stmt = $conn->prepare("SELECT student_id, reg_number, name, course_id, year FROM students WHERE student_id = ? AND deleted = 0");
+$student_stmt = $conn->prepare("SELECT student_id, reg_number, name, email, course_id, year, semester, status, photo FROM students WHERE student_id = ? AND deleted = 0");
 $student_stmt->bind_param("i", $student_id);
 $student_stmt->execute();
 $student = $student_stmt->get_result()->fetch_assoc();
 $student_stmt->close();
 
-if (!$student) {
-    header("Location: ../index.php");
-    exit();
-}
-
-// ... rest of the code continues
-<?php
-session_start();
-include '../config/db.php';
-
-if(!isset($_SESSION['student_id'])){
-    header("Location: login.php");
-    exit();
-}
-
-function safe_int($value) {
-    return filter_var($value, FILTER_VALIDATE_INT);
-}
-
-$student_id = $_SESSION['student_id'];
-$student_name = $_SESSION['student_name'] ?? 'Student';
-$course_id = $_SESSION['course_id'] ?? null;
-
-// Get student info
-$student_stmt = $conn->prepare("SELECT student_id, reg_number, name, course_id, year FROM students WHERE student_id = ? AND deleted = 0");
-$student_stmt->bind_param("i", $student_id);
-$student_stmt->execute();
-$student = $student_stmt->get_result()->fetch_assoc();
-$student_stmt->close();
-
-if (!$student) {
-    header("Location: login.php");
+if (!$student || $student['status'] !== 'active') {
+    session_destroy();
+    header("Location: login.php?inactive=1");
     exit();
 }
 
 $course_id = $student['course_id'];
 $current_year = $student['year'];
+$current_semester = $student['semester'];
+$student_photo = $student['photo'] ?? 'default-avatar.png';
 
 // Get course name
 $course_stmt = $conn->prepare("SELECT course_name FROM courses WHERE course_id = ? AND deleted = 0");
@@ -66,719 +48,925 @@ $course_stmt->bind_param("i", $course_id);
 $course_stmt->execute();
 $course = $course_stmt->get_result()->fetch_assoc();
 $course_stmt->close();
-
 $course_name = $course ? $course['course_name'] : 'Unknown Course';
 
 // ================= MARK NOTIFICATIONS AS READ =================
-if(isset($_GET['mark_notif_read'])){
-    $notif_id = safe_int($_GET['mark_notif_read']);
-    if($notif_id){
-        $read_stmt = $conn->prepare("UPDATE notifications SET status = 'read', read_at = NOW() WHERE id = ? AND student_id = ?");
-        $read_stmt->bind_param("ii", $notif_id, $student_id);
-        $read_stmt->execute();
-        $read_stmt->close();
-        // Redirect to remove query parameter
-        header("Location: dashboard.php");
-        exit();
-    }
+if (isset($_GET['mark_read'])) {
+    $notif_id = (int)$_GET['mark_read'];
+    $stmt = $conn->prepare("UPDATE notifications SET status = 'read' WHERE id = ? AND user_id = ? AND user_type = 'student'");
+    $stmt->bind_param("ii", $notif_id, $student_id);
+    $stmt->execute();
+    $stmt->close();
+    header("Location: dashboard.php");
+    exit();
 }
 
-// ================= GET UNREAD RESULT NOTIFICATIONS =================
-$unread_notif_query = "
-    SELECT 
-        n.id,
-        n.module_id,
-        n.message,
-        n.created_at,
-        m.module_code,
-        m.module_name,
-        m.semester
+if (isset($_GET['mark_all_read'])) {
+    $stmt = $conn->prepare("UPDATE notifications SET status = 'read' WHERE user_id = ? AND user_type = 'student' AND status = 'unread'");
+    $stmt->bind_param("i", $student_id);
+    $stmt->execute();
+    $stmt->close();
+    header("Location: dashboard.php");
+    exit();
+}
+
+// ================= GET NOTIFICATIONS =================
+$notif_stmt = $conn->prepare("
+    SELECT n.*, m.module_code, m.module_name
     FROM notifications n
-    INNER JOIN modules m ON n.module_id = m.module_id
-    WHERE n.student_id = ? 
-    AND n.type = 'result_published' 
-    AND n.status = 'unread'
+    LEFT JOIN modules m ON n.module_id = m.module_id
+    WHERE n.user_id = ? AND n.user_type = 'student'
     ORDER BY n.created_at DESC
-";
+    LIMIT 20
+");
+$notif_stmt->bind_param("i", $student_id);
+$notif_stmt->execute();
+$notifications = $notif_stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$notif_stmt->close();
 
-$unread_notif_stmt = $conn->prepare($unread_notif_query);
+$unread_count = count(array_filter($notifications, fn($n) => $n['status'] === 'unread'));
 
-if (!$unread_notif_stmt) {
-    $unread_notifications = array();
-    $unread_count = 0;
-} else {
-    $unread_notif_stmt->bind_param("i", $student_id);
-    $unread_notif_stmt->execute();
-    $unread_notifications = $unread_notif_stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-    $unread_notif_stmt->close();
-    $unread_count = count($unread_notifications);
-}
-
-// Fetch modules for the student's course and year
+// ================= GET MODULES FOR CURRENT YEAR =================
 $modules_query = "
-    SELECT DISTINCT 
+    SELECT 
         m.module_id,
         m.module_code,
         m.module_name,
         m.year,
         m.semester,
-        COALESCE(t.fullname, 'Unassigned') AS teacher_name
-    FROM modules m
+        t.fullname AS teacher_name
+    FROM module_enrollments me
+    JOIN modules m ON me.module_id = m.module_id
     LEFT JOIN teachers t ON m.teacher_id = t.teacher_id
-    WHERE m.deleted = 0 
-    AND m.course_id = ?
-    AND m.year = ?
-    ORDER BY m.semester ASC, m.module_code ASC
+    WHERE me.student_id = ? AND m.deleted = 0
+    ORDER BY m.year, m.semester, m.module_code
 ";
 
 $modules_stmt = $conn->prepare($modules_query);
-$modules_stmt->bind_param("ii", $course_id, $current_year);
+$modules_stmt->bind_param("i", $student_id);
 $modules_stmt->execute();
-$modules_result = $modules_stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$modules = $modules_stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $modules_stmt->close();
 
-// ================= FETCH RESULTS WITH STATUS =================
-$results_query = "
+// Group modules by year/semester
+$grouped_modules = [];
+foreach ($modules as $m) {
+    $key = "Year {$m['year']} - Semester {$m['semester']}";
+    if (!isset($grouped_modules[$key])) {
+        $grouped_modules[$key] = [];
+    }
+    $grouped_modules[$key][] = $m;
+}
+
+// ================= GET ALL RESULTS FROM ALL YEARS =================
+$all_results_query = "
     SELECT 
-        r.id as result_id,
-        r.module_id,
-        r.ca_marks,
-        r.final_marks,
-        r.grade,
-        r.status as result_status,
+        r.*,
         m.module_code,
         m.module_name,
         m.year,
         m.semester
     FROM results r
-    INNER JOIN modules m ON r.module_id = m.module_id
-    WHERE r.student_id = ?
-    AND m.course_id = ?
-    AND m.deleted = 0
-    ORDER BY m.year DESC, m.semester DESC, m.module_code ASC
+    JOIN modules m ON r.module_id = m.module_id
+    WHERE r.student_id = ? AND m.deleted = 0
+    ORDER BY m.year DESC, m.semester DESC, m.module_code
 ";
 
-$results_stmt = $conn->prepare($results_query);
+$all_results_stmt = $conn->prepare($all_results_query);
+$all_results_stmt->bind_param("i", $student_id);
+$all_results_stmt->execute();
+$all_results = $all_results_stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$all_results_stmt->close();
 
-if (!$results_stmt) {
-    $results = array();
-} else {
-    $results_stmt->bind_param("ii", $student_id, $course_id);
-    $results_stmt->execute();
-    $results = $results_stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-    $results_stmt->close();
+// Process results to add supplementary status
+foreach ($all_results as &$r) {
+    $ca_marks = $r['ca_marks'] ?? 0;
+    $final_marks = $r['final_marks'] ?? 0;
+    $total = $ca_marks + $final_marks;
+    
+    // Supplementary conditions:
+    $ca_half = 30;
+    $final_half = 20;
+    $total_half = 50;
+    
+    $is_supplementary = ($ca_marks < $ca_half) || ($final_marks < $final_half) || ($total < $total_half);
+    $r['status_display'] = $is_supplementary ? 'Supplementary' : 'Pass';
+    $r['status_class'] = $is_supplementary ? 'badge-supplementary' : 'badge-pass';
+    $r['total'] = $total;
 }
 
-// Calculate statistics
-$total_modules = count($modules_result);
-$published_results = array_filter($results, function($r) { return $r['result_status'] === 'published'; });
-$draft_results = array_filter($results, function($r) { return $r['result_status'] === 'draft'; });
+// Group results by year
+$results_by_year = [];
+foreach ($all_results as $r) {
+    $year = $r['year'];
+    if (!isset($results_by_year[$year])) {
+        $results_by_year[$year] = [];
+    }
+    $results_by_year[$year][] = $r;
+}
 
-$modules_with_results = count($published_results);
-$total_marks = 0;
-$results_count = 0;
-$passed_count = 0;
-$supplementary_count = 0;
+// Separate published and draft
+$published_results = array_filter($all_results, fn($r) => $r['status'] === 'published');
+$draft_results = array_filter($all_results, fn($r) => $r['status'] === 'draft');
+
+// ================= GET ATTENDANCE FROM ALL YEARS =================
+$attendance_query = "
+    SELECT 
+        a.*,
+        m.module_code,
+        m.module_name,
+        m.year
+    FROM attendance a
+    JOIN modules m ON a.module_id = m.module_id
+    WHERE a.student_id = ? AND a.status = 'published'
+    ORDER BY m.year, m.module_code
+";
+
+$attendance_stmt = $conn->prepare($attendance_query);
+$attendance_stmt->bind_param("i", $student_id);
+$attendance_stmt->execute();
+$attendance_records = $attendance_stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$attendance_stmt->close();
+
+// Group attendance by year
+$attendance_by_year = [];
+foreach ($attendance_records as $a) {
+    $year = $a['year'];
+    if (!isset($attendance_by_year[$year])) {
+        $attendance_by_year[$year] = [];
+    }
+    $attendance_by_year[$year][] = $a;
+}
+
+// ================= GET ATTENDANCE NOTIFICATIONS =================
+$attendance_notif_query = "
+    SELECT n.*, m.module_code, m.module_name
+    FROM notifications n
+    LEFT JOIN modules m ON n.module_id = m.module_id
+    WHERE n.user_id = ? AND n.user_type = 'student' AND n.type = 'attendance_published' AND n.status = 'unread'
+    ORDER BY n.created_at DESC
+";
+
+$attendance_notif_stmt = $conn->prepare($attendance_notif_query);
+$attendance_notif_stmt->bind_param("i", $student_id);
+$attendance_notif_stmt->execute();
+$attendance_notifications = $attendance_notif_stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$attendance_notif_stmt->close();
+
+// ================= CALCULATE STATISTICS =================
+$total_modules_all_years = count($modules);
+$total_results_all_years = count($published_results);
+$total_attendance_all_years = count($attendance_records);
+
+// GPA Calculation - Across ALL years
+$total_points = 0;
+$total_credits = 0;
+$grade_points = ['A' => 4.0, 'B' => 3.0, 'C' => 2.0, 'D' => 1.0, 'F' => 0.0];
 
 foreach ($published_results as $r) {
-    $total = ($r['ca_marks'] ?? 0) + ($r['final_marks'] ?? 0);
-    $total_marks += $total;
-    $results_count++;
-    
-    if ($total >= 50) {
-        $passed_count++;
-    } else {
-        $supplementary_count++;
+    if (isset($grade_points[$r['grade']])) {
+        $total_points += $grade_points[$r['grade']];
+        $total_credits++;
     }
 }
+$cumulative_gpa = $total_credits > 0 ? round($total_points / $total_credits, 2) : 0;
 
-$avg_marks = $results_count > 0 ? round($total_marks / $results_count) : 0;
+// Calculate GPA by year
+$gpa_by_year = [];
+foreach ($results_by_year as $year => $results) {
+    $year_points = 0;
+    $year_credits = 0;
+    foreach ($results as $r) {
+        if ($r['status'] === 'published' && isset($grade_points[$r['grade']])) {
+            $year_points += $grade_points[$r['grade']];
+            $year_credits++;
+        }
+    }
+    $gpa_by_year[$year] = $year_credits > 0 ? round($year_points / $year_credits, 2) : 0;
+}
 
+// Eligibility for exam
+$eligible_count = count(array_filter($attendance_records, fn($a) => ($a['is_eligible'] ?? 0) == 1));
+$not_eligible_count = count(array_filter($attendance_records, fn($a) => ($a['is_eligible'] ?? 0) == 0));
+
+// Count passes and supplementary
+$pass_count = count(array_filter($published_results, fn($r) => $r['status_display'] === 'Pass'));
+$supplementary_count = count(array_filter($published_results, fn($r) => $r['status_display'] === 'Supplementary'));
+
+// Handle photo upload
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['photo'])) {
+    $target_dir = "../uploads/students/";
+    if (!file_exists($target_dir)) {
+        mkdir($target_dir, 0777, true);
+    }
+    
+    $file_extension = strtolower(pathinfo($_FILES["photo"]["name"], PATHINFO_EXTENSION));
+    $allowed_extensions = ['jpg', 'jpeg', 'png', 'gif'];
+    
+    if (in_array($file_extension, $allowed_extensions)) {
+        $new_filename = "student_" . $student_id . "_" . time() . "." . $file_extension;
+        $target_file = $target_dir . $new_filename;
+        
+        if (move_uploaded_file($_FILES["photo"]["tmp_name"], $target_file)) {
+            // Delete old photo if not default
+            if ($student['photo'] && $student['photo'] != 'default-avatar.png' && file_exists($target_dir . $student['photo'])) {
+                unlink($target_dir . $student['photo']);
+            }
+            
+            $update = $conn->prepare("UPDATE students SET photo = ? WHERE student_id = ?");
+            $update->bind_param("si", $new_filename, $student_id);
+            $update->execute();
+            $update->close();
+            
+            $student_photo = $new_filename;
+            $photo_message = "Photo uploaded successfully!";
+        }
+    }
+}
 ?>
-
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Student Dashboard - CSMS</title>
-    <link rel="stylesheet" href="../assets/css/auth.css">
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            background: #f5f5f5;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f0f2f5;
+            color: #1e293b;
         }
-
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-
-        .auth-card {
-            width: 100%;
-            max-width: 1100px;
-            padding: 30px;
-            border-radius: 18px;
-            background: white;
-            box-shadow: 0 20px 45px rgba(0,0,0,0.15);
-            margin: 30px auto;
-        }
-
-        h2 {
-            text-align: center;
-            margin-bottom: 10px;
-            color: var(--midnight-garden);
-            font-size: 32px;
-        }
-
-        .welcome-banner {
-            background: linear-gradient(135deg, var(--terra-rosa), var(--honey-glow));
+        .header {
+            background: linear-gradient(135deg, #0f172a, #1e293b);
             color: white;
-            padding: 20px;
-            border-radius: 12px;
-            text-align: center;
-            margin-bottom: 20px;
-        }
-
-        .welcome-banner p {
-            margin: 5px 0;
-            font-size: 14px;
-        }
-
-        .student-info {
-            text-align: center;
-            color: #666;
-            margin-bottom: 20px;
-            padding: 15px;
-            background: #f9f9f9;
-            border-radius: 8px;
-            font-size: 14px;
-        }
-
-        .student-info strong {
-            color: #333;
-        }
-
-        /* NOTIFICATIONS SECTION */
-        .notifications-alert {
-            background: linear-gradient(135deg, #d4edda, #c3e6cb);
-            border: 1px solid #c3e6cb;
-            border-radius: 10px;
-            padding: 20px;
-            margin-bottom: 25px;
-            animation: slideIn 0.3s ease-in;
-        }
-
-        @keyframes slideIn {
-            from {
-                opacity: 0;
-                transform: translateY(-10px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        .notifications-alert h3 {
-            margin-top: 0;
-            margin-bottom: 15px;
-            color: #155724;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            font-size: 18px;
-        }
-
-        .notification-badge {
-            background: #155724;
-            color: white;
-            padding: 2px 10px;
-            border-radius: 12px;
-            font-size: 12px;
-            font-weight: bold;
-        }
-
-        .notification-item {
-            background: white;
-            padding: 15px;
-            margin: 10px 0;
-            border-radius: 6px;
-            border-left: 4px solid #4CAF50;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-            transition: all 0.3s;
-        }
-
-        .notification-item:hover {
-            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-        }
-
-        .notification-item p {
-            margin: 5px 0;
-            color: #333;
-        }
-
-        .notification-module {
-            font-weight: bold;
-            color: var(--midnight-garden);
-            font-size: 15px;
-        }
-
-        .notification-message {
-            color: #666;
-            font-size: 13px;
-            margin: 8px 0;
-        }
-
-        .notification-time {
-            color: #999;
-            font-size: 11px;
+            padding: 1rem 2rem;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-top: 10px;
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            width: 100%;
         }
-
-        .btn-mark-read {
-            padding: 5px 15px;
-            background: #4CAF50;
+        .logo h1 {
+            font-size: 1.8rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #16a085, #117a65);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .student-info {
+            display: flex;
+            align-items: center;
+            gap: 2rem;
+        }
+        .notif-badge {
+            background: #16a085;
+            color: white;
+            padding: 0.2rem 0.6rem;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            margin-left: 0.5rem;
+        }
+        .logout-btn {
+            background: rgba(255,255,255,0.1);
+            color: white;
+            padding: 0.5rem 1.2rem;
+            border-radius: 8px;
+            text-decoration: none;
+            transition: all 0.3s;
+        }
+        .logout-btn:hover { background: #16a085; }
+        .container {
+            max-width: 1400px;
+            margin: 2rem auto;
+            padding: 0 2rem;
+        }
+        .profile-section {
+            background: white;
+            border-radius: 20px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
+            display: flex;
+            align-items: center;
+            gap: 2rem;
+            flex-wrap: wrap;
+        }
+        .profile-photo {
+            width: 120px;
+            height: 120px;
+            border-radius: 50%;
+            object-fit: cover;
+            border: 3px solid #16a085;
+        }
+        .profile-photo-placeholder {
+            width: 120px;
+            height: 120px;
+            border-radius: 50%;
+            background: #e2e8f0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 3rem;
+            color: #94a3b8;
+            border: 3px solid #16a085;
+        }
+        .photo-upload {
+            flex: 1;
+        }
+        .photo-upload form {
+            display: flex;
+            gap: 1rem;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .btn-upload {
+            background: #16a085;
+            color: white;
+            padding: 0.5rem 1rem;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+        .welcome-banner {
+            background: linear-gradient(135deg, #0f172a, #1e293b);
+            color: white;
+            padding: 2rem;
+            border-radius: 20px;
+            margin-bottom: 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .student-details {
+            background: rgba(255,255,255,0.1);
+            padding: 0.8rem 1.5rem;
+            border-radius: 10px;
+            font-size: 0.9rem;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        .stat-card {
+            background: white;
+            padding: 1.5rem;
+            border-radius: 16px;
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
+            border-left: 4px solid #16a085;
+        }
+        .stat-number { font-size: 2rem; font-weight: 700; color: #0f172a; }
+        .stat-label { color: #64748b; font-size: 0.9rem; margin-top: 0.25rem; }
+        .section-title {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: #0f172a;
+            margin: 2rem 0 1.5rem;
+            padding-bottom: 0.75rem;
+            border-bottom: 3px solid #16a085;
+            width: 100%;
+        }
+        .year-title {
+            font-size: 1.3rem;
+            font-weight: 600;
+            color: #0f172a;
+            margin: 2rem 0 1rem;
+            padding: 0.5rem 1rem;
+            background: #e2e8f0;
+            border-radius: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .gpa-year {
+            background: #16a085;
+            color: white;
+            padding: 0.25rem 1rem;
+            border-radius: 20px;
+            font-size: 0.9rem;
+        }
+        .notification-section {
+            background: white;
+            border-radius: 16px;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
+        }
+        .notification-item {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: 1rem;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        .notification-item.unread {
+            background: #f0f9ff;
+            border-left: 4px solid #16a085;
+        }
+        .notification-icon {
+            width: 40px; height: 40px;
+            background: #e0f2fe;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2rem;
+        }
+        .notification-content { flex: 1; }
+        .notification-title { font-weight: 600; }
+        .notification-time { font-size: 0.8rem; color: #64748b; }
+        .btn-mark {
+            padding: 0.3rem 0.8rem;
+            background: #16a085;
             color: white;
             border: none;
             border-radius: 4px;
             cursor: pointer;
-            font-size: 11px;
-            font-weight: bold;
             text-decoration: none;
-            display: inline-block;
-            transition: all 0.3s;
+            font-size: 0.8rem;
         }
-
-        .btn-mark-read:hover {
-            background: #45a049;
-            transform: scale(1.05);
-        }
-
-        /* STATS SECTION */
-        .stats {
+        .modules-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
-            margin: 25px 0;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 1.5rem;
+            margin-top: 1.5rem;
         }
-
-        .stat-card {
-            background: linear-gradient(135deg, var(--terra-rosa), var(--honey-glow));
+        .module-card {
+            background: white;
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
+            border-left: 4px solid #16a085;
+        }
+        .module-header {
+            background: linear-gradient(135deg, #0f172a, #1e293b);
             color: white;
-            padding: 20px;
-            border-radius: 10px;
-            text-align: center;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            transition: transform 0.3s;
+            padding: 1rem;
         }
-
-        .stat-card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 8px 12px rgba(0,0,0,0.15);
+        .module-code { font-size: 1.1rem; font-weight: 600; }
+        .module-body { padding: 1rem; }
+        .module-teacher {
+            color: #64748b;
+            font-size: 0.9rem;
+            margin: 0.5rem 0;
         }
-
-        .stat-number {
-            font-size: 32px;
-            font-weight: bold;
-            margin: 10px 0;
-        }
-
-        .stat-label {
-            font-size: 12px;
-            opacity: 0.9;
-        }
-
-        /* TABLES */
-        h3 {
-            margin-top: 35px;
-            margin-bottom: 15px;
-            color: var(--midnight-garden);
-            border-bottom: 3px solid var(--minty-fresh);
-            padding-bottom: 10px;
-            font-size: 20px;
-        }
-
         table {
             width: 100%;
             border-collapse: collapse;
-            margin-bottom: 30px;
             background: white;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            border-radius: 8px;
+            border-radius: 16px;
             overflow: hidden;
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
+            margin-bottom: 2rem;
         }
-
-        th, td {
-            padding: 12px 15px;
-            border-bottom: 1px solid #eee;
-            text-align: center;
-            font-size: 13px;
-        }
-
-        th:first-child, td:first-child {
-            text-align: left;
-        }
-
         th {
-            background: linear-gradient(135deg, var(--skipping-stones), var(--minty-fresh));
-            color: var(--art-craft);
-            font-weight: bold;
-            border-bottom: 2px solid #ddd;
+            background: #f8fafc;
+            padding: 1rem;
+            text-align: left;
+            font-weight: 600;
+            border-bottom: 2px solid #e2e8f0;
         }
-
-        tr:hover {
-            background: #f9f9f9;
-        }
-
-        tr:last-child td {
-            border-bottom: none;
-        }
-
+        td { padding: 1rem; border-bottom: 1px solid #e2e8f0; }
         .badge {
             display: inline-block;
-            padding: 4px 12px;
-            border-radius: 12px;
-            font-size: 10px;
-            font-weight: bold;
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
         }
-
-        .badge-published {
-            background: #d4edda;
-            color: #155724;
+        .badge-published { background: #d1fae5; color: #065f46; }
+        .badge-draft { background: #fef3c7; color: #92400e; }
+        .badge-pass { background: #d1fae5; color: #065f46; }
+        .badge-supplementary { background: #fef3c7; color: #92400e; }
+        .badge-eligible { background: #d1fae5; color: #065f46; }
+        .badge-not-eligible { background: #fee2e2; color: #991b1b; }
+        .grade-badge {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-weight: 600;
         }
-
-        .badge-draft {
-            background: #fff3cd;
-            color: #856404;
+        .grade-A { background: #d1fae5; color: #065f46; }
+        .grade-B { background: #dbeafe; color: #1e40af; }
+        .grade-C { background: #fef3c7; color: #92400e; }
+        .grade-D { background: #fee2e2; color: #991b1b; }
+        .grade-F { background: #fee2e2; color: #991b1b; }
+        .transcript-box {
+            background: white;
+            border-radius: 16px;
+            padding: 2rem;
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
         }
-
-        .badge-pass {
-            background: #d4edda;
-            color: #155724;
-        }
-
-        .badge-supplementary {
-            background: #fff3cd;
-            color: #856404;
-        }
-
-        .no-data {
+        .letterhead {
             text-align: center;
-            padding: 50px 20px;
-            color: #999;
-            background: #f9f9f9;
-            border-radius: 10px;
-            margin: 20px 0;
-            font-size: 15px;
+            margin-bottom: 2rem;
+            padding-bottom: 1rem;
+            border-bottom: 2px solid #16a085;
         }
-
-        /* RESULTS SECTION */
-        .results-section {
-            margin-top: 40px;
+        .gpa-display {
+            font-size: 3rem;
+            font-weight: 700;
+            color: #16a085;
         }
-
-        .results-tabs {
+        .tabs {
             display: flex;
-            gap: 10px;
-            margin-bottom: 20px;
-            border-bottom: 2px solid #eee;
+            gap: 1rem;
+            margin-bottom: 2rem;
+            border-bottom: 2px solid #e2e8f0;
             flex-wrap: wrap;
         }
-
         .tab-btn {
-            padding: 12px 20px;
+            padding: 0.8rem 1.5rem;
             background: none;
             border: none;
-            border-bottom: 3px solid transparent;
             cursor: pointer;
-            font-weight: bold;
-            color: #666;
-            transition: all 0.3s;
-            font-size: 14px;
+            font-weight: 600;
+            color: #64748b;
+            border-bottom: 3px solid transparent;
         }
-
         .tab-btn.active {
-            color: var(--terra-rosa);
-            border-bottom-color: var(--terra-rosa);
+            color: #16a085;
+            border-bottom-color: #16a085;
         }
-
-        .tab-btn:hover {
-            color: var(--terra-rosa);
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .action-buttons {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            margin-top: 2rem;
         }
-
-        .tab-content {
-            display: none;
-        }
-
-        .tab-content.active {
-            display: block;
-            animation: fadeIn 0.3s ease-in;
-        }
-
-        @keyframes fadeIn {
-            from { opacity: 0; }
-            to { opacity: 1; }
-        }
-
-        /* FOOTER */
-        .auth-links {
-            text-align: center;
-            margin-top: 40px;
-            padding-top: 30px;
-            border-top: 2px solid #eee;
-        }
-
-        .auth-links a {
+        .btn-pdf {
+            background: #16a085;
             color: white;
+            padding: 0.8rem 2rem;
+            border: none;
+            border-radius: 8px;
             text-decoration: none;
-            font-weight: bold;
-            margin: 0 15px;
-            display: inline-block;
-            padding: 10px 20px;
-            background: var(--terra-rosa);
-            border-radius: 6px;
-            transition: all 0.3s;
+            font-weight: 600;
+            cursor: pointer;
         }
-
-        .auth-links a:hover {
-            background: var(--honey-glow);
-            transform: scale(1.05);
+        .btn-print {
+            background: #0f172a;
+            color: white;
+            padding: 0.8rem 2rem;
+            border: none;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 600;
+            cursor: pointer;
         }
-
-        /* RESPONSIVE */
+        @media print {
+            .header, .tabs, .action-buttons, .btn-print, .btn-pdf, .profile-section, .notification-section {
+                display: none;
+            }
+            .transcript-box {
+                box-shadow: none;
+                padding: 0;
+            }
+        }
         @media (max-width: 768px) {
-            .auth-card {
-                padding: 15px;
-                margin: 15px;
-            }
-
-            h2 {
-                font-size: 24px;
-            }
-
-            h3 {
-                font-size: 16px;
-            }
-
-            .stats {
-                grid-template-columns: repeat(2, 1fr);
-            }
-
-            table {
-                font-size: 11px;
-            }
-
-            th, td {
-                padding: 8px;
-            }
-
-            .results-tabs {
-                flex-wrap: wrap;
-            }
-
-            .tab-btn {
-                padding: 8px 12px;
-                font-size: 12px;
-            }
-
-            .stat-number {
-                font-size: 24px;
-            }
-
-            .stat-label {
-                font-size: 11px;
-            }
+            .container { padding: 0 1rem; }
+            .modules-grid { grid-template-columns: 1fr; }
+            .profile-section { flex-direction: column; text-align: center; }
         }
     </style>
 </head>
 <body>
-
-<div class="container">
-    <div class="auth-card">
-        <h2>📚 Student Dashboard</h2>
-        
-        <div class="welcome-banner">
-            <p>Welcome, <strong><?= htmlspecialchars($student['name']) ?></strong>!</p>
-            <p>Here's your academic progress and results summary</p>
+    <div class="header">
+        <div class="logo">
+            <h1>CSMS Student</h1>
         </div>
-
         <div class="student-info">
-            <strong>Reg #:</strong> <?= htmlspecialchars($student['reg_number']) ?> | 
-            <strong>Year:</strong> <?= $current_year ?> | 
-            <strong>Course:</strong> <?= htmlspecialchars($course_name) ?>
+            <span><?= htmlspecialchars($student_name) ?></span>
+            <?php if ($unread_count > 0): ?>
+                <span class="notif-badge"><?= $unread_count ?> New</span>
+            <?php endif; ?>
+            <a href="logout.php" class="logout-btn">Logout</a>
+        </div>
+    </div>
+
+    <div class="container">
+        <!-- Profile Section with Photo -->
+        <div class="profile-section">
+            <?php if ($student_photo && file_exists("../uploads/students/" . $student_photo)): ?>
+                <img src="../uploads/students/<?= $student_photo ?>?t=<?= time() ?>" alt="Profile" class="profile-photo">
+            <?php else: ?>
+                <div class="profile-photo-placeholder">
+                    <?= strtoupper(substr($student_name, 0, 1)) ?>
+                </div>
+            <?php endif; ?>
+            
+            <div class="photo-upload">
+                <h3><?= htmlspecialchars($student_name) ?></h3>
+                <p><?= htmlspecialchars($student['reg_number']) ?></p>
+                <p><?= htmlspecialchars($course_name) ?> | Current: Year <?= $current_year ?> - Sem <?= $current_semester ?></p>
+                <form method="POST" enctype="multipart/form-data">
+                    <input type="file" name="photo" accept="image/*" required>
+                    <button type="submit" class="btn-upload">Upload Photo</button>
+                </form>
+                <?php if (isset($photo_message)): ?>
+                    <p style="color: #16a085; margin-top: 0.5rem;"><?= $photo_message ?></p>
+                <?php endif; ?>
+            </div>
         </div>
 
-        <!-- ================= NOTIFICATIONS SECTION ================= -->
-        <?php if($unread_count > 0): ?>
-        <div class="notifications-alert">
-            <h3>
-                🔔 Results Published!
-                <span class="notification-badge"><?= $unread_count ?> New</span>
-            </h3>
+        <!-- Welcome Banner -->
+        <div class="welcome-banner">
+            <div>
+                <h2>Welcome, <?= htmlspecialchars($student_name) ?>!</h2>
+                <p>Your complete academic history across all years</p>
+            </div>
+            <div class="student-details">
+                <strong><?= htmlspecialchars($student['reg_number']) ?></strong> | 
+                Cumulative GPA: <strong><?= $cumulative_gpa ?></strong>
+            </div>
+        </div>
 
-            <?php foreach($unread_notifications as $notif): ?>
-            <div class="notification-item">
-                <p class="notification-module">✅ <?= htmlspecialchars($notif['module_code']) ?> - <?= htmlspecialchars($notif['module_name']) ?></p>
-                <p class="notification-message"><?= htmlspecialchars($notif['message']) ?></p>
-                <div class="notification-time">
-                    <span>📅 <?= date('M d, Y H:i', strtotime($notif['created_at'])) ?></span>
-                    <a href="?mark_notif_read=<?= $notif['id'] ?>" class="btn-mark-read">✓ Mark as read</a>
+        <!-- Statistics -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-number"><?= count($all_results) ?></div>
+                <div class="stat-label">Total Modules Taken</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number"><?= $pass_count ?></div>
+                <div class="stat-label">Passed</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number"><?= $supplementary_count ?></div>
+                <div class="stat-label">Supplementary</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number"><?= $cumulative_gpa ?></div>
+                <div class="stat-label">Cumulative GPA</div>
+            </div>
+        </div>
+
+        <!-- Notifications -->
+        <?php if ($unread_count > 0): ?>
+        <div class="notification-section">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                <h3 style="color: #0f172a;">🔔 Notifications (<?= $unread_count ?> new)</h3>
+                <a href="?mark_all_read=1" class="btn-mark">Mark all as read</a>
+            </div>
+            <?php foreach (array_filter($notifications, fn($n) => $n['status'] === 'unread') as $notif): ?>
+            <div class="notification-item unread">
+                <div class="notification-icon">📢</div>
+                <div class="notification-content">
+                    <div class="notification-title">
+                        <?= htmlspecialchars($notif['module_code'] ?? 'System') ?>
+                    </div>
+                    <div><?= htmlspecialchars($notif['message']) ?></div>
+                    <div class="notification-time">
+                        <?= date('M d, Y H:i', strtotime($notif['created_at'])) ?>
+                    </div>
                 </div>
+                <a href="?mark_read=<?= $notif['id'] ?>" class="btn-mark">✓ Read</a>
             </div>
             <?php endforeach; ?>
         </div>
         <?php endif; ?>
 
-        <!-- Statistics -->
-        <div class="stats">
-            <div class="stat-card">
-                <div class="stat-label">📚 Total Modules</div>
-                <div class="stat-number"><?= $total_modules ?></div>
+        <!-- Attendance Notifications -->
+        <?php if (count($attendance_notifications) > 0): ?>
+        <div class="notification-section" style="border-left: 4px solid #8b5cf6;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                <h3 style="color: #0f172a;">📋 New Attendance Reports</h3>
             </div>
-            <div class="stat-card">
-                <div class="stat-label">✅ Published Results</div>
-                <div class="stat-number"><?= $modules_with_results ?></div>
+            <?php foreach ($attendance_notifications as $notif): ?>
+            <div class="notification-item unread">
+                <div class="notification-icon">📊</div>
+                <div class="notification-content">
+                    <div class="notification-title">
+                        <?= htmlspecialchars($notif['module_code']) ?> - Attendance Published
+                    </div>
+                    <div><?= htmlspecialchars($notif['message']) ?></div>
+                    <div class="notification-time">
+                        <?= date('M d, Y H:i', strtotime($notif['created_at'])) ?>
+                    </div>
+                </div>
+                <a href="?mark_read=<?= $notif['id'] ?>" class="btn-mark">✓ Read</a>
             </div>
-            <div class="stat-card">
-                <div class="stat-label">⏳ Pending Results</div>
-                <div class="stat-number"><?= count($draft_results) ?></div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">📊 Average Marks</div>
-                <div class="stat-number"><?= $avg_marks ?>%</div>
-            </div>
+            <?php endforeach; ?>
         </div>
-
-        <!-- Modules by Year -->
-        <h3>📘 Registered Modules (Year <?= $current_year ?>)</h3>
-        <?php if (count($modules_result) > 0): ?>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Code</th>
-                        <th>Module Name</th>
-                        <th>Semester</th>
-                        <th>Teacher</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <?php foreach ($modules_result as $m): ?>
-                    <tr>
-                        <td><strong><?= htmlspecialchars($m['module_code']) ?></strong></td>
-                        <td><?= htmlspecialchars($m['module_name']) ?></td>
-                        <td><strong>Sem <?= $m['semester'] ?></strong></td>
-                        <td><?= htmlspecialchars($m['teacher_name']) ?></td>
-                    </tr>
-                    <?php endforeach; ?>
-                </tbody>
-            </table>
-        <?php else: ?>
-            <div class="no-data">📭 No modules registered for this course and year</div>
         <?php endif; ?>
 
-        <!-- Results Section with Tabs -->
-        <div class="results-section">
-            <h3>📊 My Results</h3>
+        <!-- Tabs -->
+        <div class="tabs">
+            <button class="tab-btn active" onclick="switchTab(event, 'modules')">📚 Current Modules</button>
+            <button class="tab-btn" onclick="switchTab(event, 'results')">📊 All Results</button>
+            <button class="tab-btn" onclick="switchTab(event, 'attendance')">📋 Attendance History</button>
+            <button class="tab-btn" onclick="switchTab(event, 'transcript')">📄 Complete Transcript</button>
+        </div>
 
-            <!-- Tab Buttons -->
-            <div class="results-tabs">
-                <button class="tab-btn active" onclick="switchTab(event, 'published')">
-                    ✅ Published (<?= count($published_results) ?>)
-                </button>
-                <button class="tab-btn" onclick="switchTab(event, 'draft')">
-                    ⏳ Pending (<?= count($draft_results) ?>)
-                </button>
-                <button class="tab-btn" onclick="switchTab(event, 'all')">
-                    📋 All Results (<?= count($results) ?>)
-                </button>
-            </div>
+        <!-- MODULES TAB (Current Year) -->
+        <div id="modules" class="tab-content active">
+            <h3 class="section-title">Current Year Modules (Year <?= $current_year ?>)</h3>
+            <?php if (empty($modules)): ?>
+                <p style="text-align: center; padding: 3rem; color: #64748b;">No modules enrolled for current year.</p>
+            <?php else: ?>
+                <?php foreach ($grouped_modules as $period => $mods): ?>
+                <h4 style="margin: 1.5rem 0 0.5rem; color: #0f172a;"><?= $period ?></h4>
+                <div class="modules-grid">
+                    <?php foreach ($mods as $m): ?>
+                    <div class="module-card">
+                        <div class="module-header">
+                            <div class="module-code"><?= htmlspecialchars($m['module_code']) ?></div>
+                        </div>
+                        <div class="module-body">
+                            <div style="font-weight: 600;"><?= htmlspecialchars($m['module_name']) ?></div>
+                            <div class="module-teacher">👨‍🏫 <?= htmlspecialchars($m['teacher_name'] ?? 'Staff') ?></div>
+                        </div>
+                    </div>
+                    <?php endforeach; ?>
+                </div>
+                <?php endforeach; ?>
+            <?php endif; ?>
+        </div>
 
-            <!-- Published Results Tab -->
-            <div id="published" class="tab-content active">
-                <?php if (count($published_results) > 0): ?>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Code</th>
-                                <th>Module Name</th>
-                                <th>Sem</th>
-                                <th>CA (0-60)</th>
-                                <th>Final (0-40)</th>
-                                <th>Total</th>
-                                <th>Grade</th>
-                                <th>Status</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <?php foreach ($published_results as $r): 
-                                $total = ($r['ca_marks'] ?? 0) + ($r['final_marks'] ?? 0);
-                                $status = $total >= 50 ? 'Passed' : 'Supplementary';
-                                $status_class = $total >= 50 ? 'badge-pass' : 'badge-supplementary';
-                            ?>
-                            <tr>
-                                <td><strong><?= htmlspecialchars($r['module_code']) ?></strong></td>
-                                <td><?= htmlspecialchars($r['module_name']) ?></td>
-                                <td><?= $r['semester'] ?></td>
-                                <td><?= $r['ca_marks'] ?? '-' ?></td>
-                                <td><?= $r['final_marks'] ?? '-' ?></td>
-                                <td><strong><?= $total ?></strong></td>
-                                <td><?= htmlspecialchars($r['grade'] ?? '-') ?></td>
-                                <td><span class="badge <?= $status_class ?>">
-                                    <?= $status === 'Passed' ? '✓ Passed' : '⚠️ Supplementary' ?>
-                                </span></td>
-                            </tr>
-                            <?php endforeach; ?>
-                        </tbody>
-                    </table>
-                <?php else: ?>
-                    <div class="no-data">📭 No published results yet. Check back soon!</div>
+        <!-- RESULTS TAB (All Years) -->
+        <div id="results" class="tab-content">
+            <h3 class="section-title">Complete Academic Results</h3>
+            <?php if (empty($all_results)): ?>
+                <p style="text-align: center; padding: 3rem; color: #64748b;">No results available yet.</p>
+            <?php else: ?>
+                <?php foreach ($results_by_year as $year => $year_results): 
+                    $year_gpa = $gpa_by_year[$year] ?? 0;
+                ?>
+                <div class="year-title">
+                    <span>📅 Year <?= $year ?></span>
+                    <span class="gpa-year">GPA: <?= $year_gpa ?></span>
+                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Code</th>
+                            <th>Module</th>
+                            <th>Semester</th>
+                            <th>CA (60)</th>
+                            <th>Final (40)</th>
+                            <th>Total</th>
+                            <th>Grade</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($year_results as $r): 
+                            $grade_class = 'grade-' . ($r['grade'] ?? 'F');
+                        ?>
+                        <tr>
+                            <td><strong><?= htmlspecialchars($r['module_code']) ?></strong></td>
+                            <td><?= htmlspecialchars($r['module_name']) ?></td>
+                            <td><?= $r['semester'] ?></td>
+                            <td><?= $r['ca_marks'] ?? '-' ?></td>
+                            <td><?= $r['final_marks'] ?? '-' ?></td>
+                            <td><strong><?= $r['total'] ?></strong></td>
+                            <td><span class="grade-badge <?= $grade_class ?>"><?= $r['grade'] ?? '-' ?></span></td>
+                            <td><span class="badge <?= $r['status_class'] ?>"><?= $r['status_display'] ?></span></td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+                <?php endforeach; ?>
+
+                <?php if (!empty($draft_results)): ?>
+                <h4 style="margin: 2rem 0 1rem;">⏳ Pending Results</h4>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Code</th>
+                            <th>Module</th>
+                            <th>Year</th>
+                            <th>Semester</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($draft_results as $r): ?>
+                        <tr>
+                            <td><?= htmlspecialchars($r['module_code']) ?></td>
+                            <td><?= htmlspecialchars($r['module_name']) ?></td>
+                            <td><?= $r['year'] ?></td>
+                            <td><?= $r['semester'] ?></td>
+                            <td><span class="badge badge-draft">Awaiting Publication</span></td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
                 <?php endif; ?>
-            </div>
+            <?php endif; ?>
+        </div>
 
-            <!-- Pending Results Tab -->
-            <div id="draft" class="tab-content">
-                <?php if (count($draft_results) > 0): ?>
-                    <table>
+        <!-- ATTENDANCE TAB (All Years) -->
+        <div id="attendance" class="tab-content">
+            <h3 class="section-title">Attendance History & Exam Eligibility</h3>
+            
+            <?php if (empty($attendance_records)): ?>
+                <p style="text-align: center; padding: 3rem; color: #64748b;">No attendance records published yet.</p>
+            <?php else: ?>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 2rem;">
+                    <div class="stat-card" style="border-left-color: #10b981;">
+                        <div class="stat-number"><?= $eligible_count ?></div>
+                        <div class="stat-label">Modules Eligible (≥60%)</div>
+                    </div>
+                    <div class="stat-card" style="border-left-color: #ef4444;">
+                        <div class="stat-number"><?= $not_eligible_count ?></div>
+                        <div class="stat-label">Modules Not Eligible</div>
+                    </div>
+                </div>
+
+                <?php foreach ($attendance_by_year as $year => $year_attendance): ?>
+                <h4 style="margin: 2rem 0 1rem; color: #0f172a;">📅 Year <?= $year ?> Attendance</h4>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Module</th>
+                            <th>Total Classes</th>
+                            <th>Attended</th>
+                            <th>Percentage</th>
+                            <th>Eligibility</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($year_attendance as $a): 
+                            $pct = $a['attendance_percentage'] ?? 0;
+                            $eligible = ($a['is_eligible'] ?? 0) == 1;
+                        ?>
+                        <tr>
+                            <td><strong><?= htmlspecialchars($a['module_code']) ?></strong></td>
+                            <td><?= $a['total_classes'] ?? '-' ?></td>
+                            <td><?= $a['attended_classes'] ?? '-' ?></td>
+                            <td><?= $a['attended_classes'] ? number_format($pct, 1).'%' : '-' ?></td>
+                            <td>
+                                <span class="badge <?= $eligible ? 'badge-eligible' : 'badge-not-eligible' ?>">
+                                    <?= $eligible ? '✓ Eligible' : '❌ Not Eligible' ?>
+                                </span>
+                            </td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+                <?php endforeach; ?>
+            <?php endif; ?>
+        </div>
+
+        <!-- TRANSCRIPT TAB (Complete Record) -->
+        <div id="transcript" class="tab-content">
+            <div class="transcript-box" id="transcript-content">
+                <!-- Letterhead -->
+                <div class="letterhead">
+                    <h2>DON BOSCO KILIMANJARO INTERNATIONAL INSTITUTE</h2>
+                    <p>FOR TELECOMMUNICATIONS, ELECTRONICS AND COMPUTERS</p>
+                    <p>P.O BOX 3172, ARUSHA, Tel: 0757 845118</p>
+                    <p>Email: info@kiitec.ac.tz | Website: www.kiitec.ac.tz</p>
+                    <hr style="margin: 1rem 0; border: 1px solid #16a085;">
+                </div>
+
+                <div style="text-align: center; margin-bottom: 2rem;">
+                    <h3 style="color: #0f172a;">COMPLETE ACADEMIC TRANSCRIPT</h3>
+                    <p><strong><?= htmlspecialchars($student_name) ?></strong> | <?= htmlspecialchars($student['reg_number']) ?></p>
+                    <p><?= htmlspecialchars($course_name) ?></p>
+                    <p>Enrolled: Year <?= $student['year'] ?> - Semester <?= $student['semester'] ?></p>
+                </div>
+
+                <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-bottom: 2rem; text-align: center;">
+                    <div>
+                        <div class="stat-label">Cumulative GPA</div>
+                        <div class="gpa-display"><?= $cumulative_gpa ?></div>
+                    </div>
+                    <div>
+                        <div class="stat-label">Total Modules</div>
+                        <div class="stat-number" style="font-size: 2rem;"><?= count($all_results) ?></div>
+                    </div>
+                    <div>
+                        <div class="stat-label">Pass Rate</div>
+                        <div class="stat-number" style="font-size: 2rem;">
+                            <?= count($all_results) > 0 ? round(($pass_count / count($all_results)) * 100) : 0 ?>%
+                        </div>
+                    </div>
+                </div>
+
+                <?php if (!empty($all_results)): ?>
+                    <?php foreach ($results_by_year as $year => $year_results): 
+                        $year_gpa = $gpa_by_year[$year] ?? 0;
+                    ?>
+                    <h4 style="margin: 2rem 0 1rem; border-bottom: 1px solid #16a085; padding-bottom: 0.5rem;">
+                        Year <?= $year ?> (GPA: <?= $year_gpa ?>)
+                    </h4>
+                    <table style="margin-bottom: 2rem;">
                         <thead>
                             <tr>
                                 <th>Code</th>
-                                <th>Module Name</th>
-                                <th>Semester</th>
-                                <th>Status</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <?php foreach ($draft_results as $r): ?>
-                            <tr>
-                                <td><strong><?= htmlspecialchars($r['module_code']) ?></strong></td>
-                                <td><?= htmlspecialchars($r['module_name']) ?></td>
-                                <td><?= $r['semester'] ?></td>
-                                <td><span class="badge badge-draft">⏳ Awaiting Publication</span></td>
-                            </tr>
-                            <?php endforeach; ?>
-                        </tbody>
-                    </table>
-                <?php else: ?>
-                    <div class="no-data">✅ No pending results!</div>
-                <?php endif; ?>
-            </div>
-
-            <!-- All Results Tab -->
-            <div id="all" class="tab-content">
-                <?php if (count($results) > 0): ?>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Code</th>
-                                <th>Module Name</th>
+                                <th>Module</th>
                                 <th>Sem</th>
                                 <th>CA</th>
                                 <th>Final</th>
@@ -788,68 +976,64 @@ $avg_marks = $results_count > 0 ? round($total_marks / $results_count) : 0;
                             </tr>
                         </thead>
                         <tbody>
-                            <?php foreach ($results as $r): 
-                                $total = ($r['ca_marks'] ?? 0) + ($r['final_marks'] ?? 0);
-                                $status = $r['result_status'] === 'published' ? 'Published' : 'Pending';
-                                $status_class = $r['result_status'] === 'published' ? 'badge-published' : 'badge-draft';
-                            ?>
+                            <?php foreach ($year_results as $r): ?>
                             <tr>
-                                <td><strong><?= htmlspecialchars($r['module_code']) ?></strong></td>
+                                <td><?= htmlspecialchars($r['module_code']) ?></td>
                                 <td><?= htmlspecialchars($r['module_name']) ?></td>
                                 <td><?= $r['semester'] ?></td>
                                 <td><?= $r['ca_marks'] ?? '-' ?></td>
                                 <td><?= $r['final_marks'] ?? '-' ?></td>
-                                <td><strong><?= $total ?? '-' ?></strong></td>
-                                <td><?= htmlspecialchars($r['grade'] ?? '-') ?></td>
-                                <td><span class="badge <?= $status_class ?>">
-                                    <?= $status === 'Published' ? '✅ Published' : '⏳ Pending' ?>
-                                </span></td>
+                                <td><strong><?= $r['total'] ?></strong></td>
+                                <td><span class="grade-badge grade-<?= $r['grade'] ?>"><?= $r['grade'] ?></span></td>
+                                <td><span class="badge <?= $r['status_class'] ?>"><?= $r['status_display'] ?></span></td>
                             </tr>
                             <?php endforeach; ?>
                         </tbody>
                     </table>
-                <?php else: ?>
-                    <div class="no-data">📭 No results available yet</div>
+                    <?php endforeach; ?>
                 <?php endif; ?>
+
+                <p style="color: #64748b; font-size: 0.9rem; text-align: right;">Generated on <?= date('F d, Y') ?></p>
+                <p style="color: #64748b; font-size: 0.8rem; text-align: center; margin-top: 2rem;">This is an official transcript from CSMS</p>
+            </div>
+
+            <div class="action-buttons">
+                <button onclick="printTranscript()" class="btn-print">🖨️ Print Transcript</button>
+                <button onclick="downloadPDF()" class="btn-pdf">📥 Download PDF</button>
             </div>
         </div>
-
-        <div class="auth-links">
-            <a href="logout.php">🚪 Logout</a>
-        </div>
     </div>
-</div>
 
-<script>
-function switchTab(event, tabName) {
-    event.preventDefault();
-    
-    // Hide all tabs
-    const tabs = document.querySelectorAll('.tab-content');
-    tabs.forEach(tab => tab.classList.remove('active'));
-    
-    // Remove active class from all buttons
-    const buttons = document.querySelectorAll('.tab-btn');
-    buttons.forEach(btn => btn.classList.remove('active'));
-    
-    // Show selected tab
-    const selectedTab = document.getElementById(tabName);
-    if (selectedTab) {
-        selectedTab.classList.add('active');
-    }
-    
-    // Add active class to clicked button
-    event.target.classList.add('active');
-}
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+    <script>
+        function switchTab(event, tabId) {
+            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.getElementById(tabId).classList.add('active');
+            event.target.classList.add('active');
+        }
 
-// Prevent accidental redirect when notification is read
-document.addEventListener('click', function(e) {
-    if (e.target && e.target.classList.contains('btn-mark-read')) {
-        e.preventDefault();
-        window.location.href = e.target.href;
-    }
-});
-</script>
+        function printTranscript() {
+            const printContent = document.getElementById('transcript-content').innerHTML;
+            const originalContent = document.body.innerHTML;
+            
+            document.body.innerHTML = printContent;
+            window.print();
+            document.body.innerHTML = originalContent;
+            window.location.reload();
+        }
 
+        function downloadPDF() {
+            const element = document.getElementById('transcript-content');
+            const opt = {
+                margin:       1,
+                filename:     'transcript_<?= $student['reg_number'] ?>.pdf',
+                image:        { type: 'jpeg', quality: 0.98 },
+                html2canvas:  { scale: 2 },
+                jsPDF:        { unit: 'in', format: 'a4', orientation: 'portrait' }
+            };
+            html2pdf().set(opt).from(element).save();
+        }
+    </script>
 </body>
 </html>

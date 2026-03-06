@@ -1,614 +1,578 @@
 <?php
-session_start();
-include '../config/db.php';
+/**
+ * admin/manage_modules.php - Manage Modules for a Semester
+ */
 
-if(!isset($_SESSION['admin_logged_in'])){
-    header("Location: login.php");
+session_start();
+require_once '../config/db.php';
+require_once '../config/security_base.php';
+
+// Check admin login
+checkAdminSession();
+
+$course_id = isset($_GET['course_id']) ? (int)$_GET['course_id'] : 0;
+$year = isset($_GET['year']) ? (int)$_GET['year'] : 0;
+$semester = isset($_GET['semester']) ? (int)$_GET['semester'] : 0;
+
+if (!$course_id || !$year || !$semester) {
+    header("Location: dashboard.php");
     exit();
 }
 
-if(!isset($_GET['course_id'], $_GET['year'], $_GET['semester'])){
-    die("Invalid Access.");
-}
-
-function safe_int($value) {
-    return filter_var($value, FILTER_VALIDATE_INT);
-}
-
-function safe_string($value) {
-    return htmlspecialchars(trim($value), ENT_QUOTES, 'UTF-8');
-}
-
-$course_id = safe_int($_GET['course_id']);
-$year = safe_int($_GET['year']);
-$semester = safe_int($_GET['semester']);
-
-if (!$course_id || !$year || !$semester) {
-    die("Invalid parameters.");
-}
-
-if (empty($_SESSION['csrf_token'])) {
-    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-}
-
-$search = "";
-if(isset($_GET['search'])){
-    $search = safe_string($_GET['search']);
-}
+// Get course details
+$course_stmt = $conn->prepare("SELECT course_name FROM courses WHERE course_id = ? AND deleted = 0");
+$course_stmt->bind_param("i", $course_id);
+$course_stmt->execute();
+$course = $course_stmt->get_result()->fetch_assoc();
+$course_stmt->close();
 
 $message = "";
 $message_type = "";
+$csrf_token = generateCSRF();
 
-/* DELETE */
-if(isset($_POST['action']) && $_POST['action'] === 'delete'){
-    if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
-        $message = "Security token verification failed";
+// Handle Add Module
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'add') {
+    validateCSRF($_POST['csrf_token'] ?? '');
+    
+    $module_code = sanitizeInput($_POST['module_code'] ?? '');
+    $module_name = sanitizeInput($_POST['module_name'] ?? '');
+    $teacher_id = (int)($_POST['teacher_id'] ?? 0);
+    
+    if (empty($module_code) || empty($module_name)) {
+        $message = "Module code and name are required";
         $message_type = "error";
     } else {
-        $module_id = safe_int($_POST['module_id']);
-        if (!$module_id) {
-            $message = "Invalid module ID";
+        // Check if module code exists
+        $check = $conn->prepare("SELECT module_id FROM modules WHERE module_code = ? AND course_id = ? AND deleted = 0");
+        $check->bind_param("si", $module_code, $course_id);
+        $check->execute();
+        
+        if ($check->get_result()->num_rows > 0) {
+            $message = "Module code already exists for this course";
             $message_type = "error";
         } else {
-            $stmt = $conn->prepare("UPDATE modules SET deleted=1 WHERE module_id=?");
-            $stmt->bind_param("i", $module_id);
-            if($stmt->execute()){
-                $message = "Module deleted successfully";
-                $message_type = "success";
-            } else {
-                $message = "Error deleting module";
-                $message_type = "error";
-            }
-            $stmt->close();
-        }
-    }
-}
-
-/* UPDATE */
-if(isset($_POST['action']) && $_POST['action'] === 'update'){
-    if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
-        $message = "Security token verification failed";
-        $message_type = "error";
-    } else {
-        $module_id   = safe_int($_POST['module_id']);
-        $module_code = safe_string($_POST['module_code'] ?? '');
-        $module_name = safe_string($_POST['module_name'] ?? '');
-        $teacher_id  = safe_int($_POST['teacher_id']);
-        $status      = safe_string($_POST['status'] ?? 'active');
-
-        if(empty($module_code) || empty($module_name) || !$module_id){
-            $message = "Please fill all required fields";
-            $message_type = "error";
-        } else {
-            $stmt = $conn->prepare("UPDATE modules SET module_code=?, module_name=?, teacher_id=?, status=? WHERE module_id=?");
-            $stmt->bind_param("ssisi", $module_code, $module_name, $teacher_id, $status, $module_id);
-            if($stmt->execute()){
-                $message = "Module updated successfully";
-                $message_type = "success";
-            } else {
-                $message = "Error updating module: " . $stmt->error;
-                $message_type = "error";
-            }
-            $stmt->close();
-        }
-    }
-}
-
-/* ADD */
-if(isset($_POST['action']) && $_POST['action'] === 'add'){
-    if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
-        $message = "Security token verification failed";
-        $message_type = "error";
-    } else {
-        $module_code = safe_string($_POST['module_code'] ?? '');
-        $module_name = safe_string($_POST['module_name'] ?? '');
-        $teacher_id  = safe_int($_POST['teacher_id']);
-
-        if(empty($module_code) || empty($module_name) || !$teacher_id){
-            $message = "Please fill all required fields";
-            $message_type = "error";
-        } else {
-            $check = $conn->prepare("SELECT module_id FROM modules WHERE module_code = ? AND course_id = ? AND deleted = 0");
-            $check->bind_param("si", $module_code, $course_id);
-            $check->execute();
+            $insert = $conn->prepare("
+                INSERT INTO modules (module_code, module_name, course_id, year, semester, teacher_id, status, created_at) 
+                VALUES (?, ?, ?, ?, ?, ?, 'active', NOW())
+            ");
+            $insert->bind_param("ssiiii", $module_code, $module_name, $course_id, $year, $semester, $teacher_id);
             
-            if($check->get_result()->num_rows > 0){
-                $message = "Module code already exists";
-                $message_type = "error";
-            } else {
-                $stmt = $conn->prepare("INSERT INTO modules (module_code, module_name, course_id, year, semester, teacher_id, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'active', NOW())");
-                $stmt->bind_param("ssiiii", $module_code, $module_name, $course_id, $year, $semester, $teacher_id);
+            if ($insert->execute()) {
+                $message = "Module added successfully";
+                $message_type = "success";
                 
-                if($stmt->execute()){
-                    $message = "Module added successfully";
-                    $message_type = "success";
-                } else {
-                    $message = "Error adding module: " . $stmt->error;
-                    $message_type = "error";
-                }
-                $stmt->close();
+                // Log action
+                logAdminAction($conn, $_SESSION['admin_id'], 'add_module', "Added module: $module_code");
+            } else {
+                $message = "Error adding module";
+                $message_type = "error";
             }
-            $check->close();
+            $insert->close();
         }
+        $check->close();
     }
 }
 
-/* PAGINATION */
-$limit = 10;
-$page  = isset($_GET['page']) ? safe_int($_GET['page']) : 1;
-if (!$page) $page = 1;
-$start = ($page-1)*$limit;
-
-$whereSearch = "";
-$search_term = null;
-if($search != ""){
-    $search_term = "%" . $search . "%";
-    $whereSearch = " AND (module_code LIKE ? OR module_name LIKE ?)";
+// Handle Delete Module
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'delete') {
+    validateCSRF($_POST['csrf_token'] ?? '');
+    
+    $module_id = (int)($_POST['module_id'] ?? 0);
+    
+    if ($module_id) {
+        $stmt = $conn->prepare("UPDATE modules SET deleted = 1 WHERE module_id = ?");
+        $stmt->bind_param("i", $module_id);
+        
+        if ($stmt->execute()) {
+            $message = "Module moved to recycle bin";
+            $message_type = "success";
+            
+            // Log action
+            logAdminAction($conn, $_SESSION['admin_id'], 'delete_module', "Deleted module ID: $module_id");
+        }
+        $stmt->close();
+    }
 }
 
-$total_q = "SELECT COUNT(*) as total FROM modules WHERE deleted=0 AND course_id=? AND year=? AND semester=? $whereSearch";
-$total_stmt = $conn->prepare($total_q);
-if($search_term){
-    $total_stmt->bind_param("iiiss", $course_id, $year, $semester, $search_term, $search_term);
-} else {
-    $total_stmt->bind_param("iii", $course_id, $year, $semester);
+// Handle Update Module
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'update') {
+    validateCSRF($_POST['csrf_token'] ?? '');
+    
+    $module_id = (int)($_POST['module_id'] ?? 0);
+    $module_code = sanitizeInput($_POST['module_code'] ?? '');
+    $module_name = sanitizeInput($_POST['module_name'] ?? '');
+    $teacher_id = (int)($_POST['teacher_id'] ?? 0);
+    $status = sanitizeInput($_POST['status'] ?? 'active');
+    
+    if ($module_id && !empty($module_code) && !empty($module_name)) {
+        $update = $conn->prepare("
+            UPDATE modules 
+            SET module_code = ?, module_name = ?, teacher_id = ?, status = ? 
+            WHERE module_id = ?
+        ");
+        $update->bind_param("ssisi", $module_code, $module_name, $teacher_id, $status, $module_id);
+        
+        if ($update->execute()) {
+            $message = "Module updated successfully";
+            $message_type = "success";
+            
+            logAdminAction($conn, $_SESSION['admin_id'], 'update_module', "Updated module ID: $module_id");
+        }
+        $update->close();
+    }
 }
-$total_stmt->execute();
-$total = $total_stmt->get_result()->fetch_assoc()['total'];
-$pages = ceil($total/$limit);
-$total_stmt->close();
 
-$course_q = $conn->prepare("SELECT course_name FROM courses WHERE course_id=?");
-$course_q->bind_param("i", $course_id);
-$course_q->execute();
-$course = $course_q->get_result()->fetch_assoc();
-$course_q->close();
-
-if(!$course){
-    die("Course not found.");
-}
-
-$teachers = $conn->query("SELECT teacher_id, fullname FROM teachers WHERE deleted=0 ORDER BY fullname");
-
-$modules_q = "SELECT m.*, t.fullname AS teacher_name FROM modules m LEFT JOIN teachers t ON m.teacher_id = t.teacher_id WHERE m.deleted=0 AND m.course_id=? AND m.year=? AND m.semester=? $whereSearch ORDER BY m.module_code ASC LIMIT ? OFFSET ?";
-
-$modules_stmt = $conn->prepare($modules_q);
-if($search_term){
-    $modules_stmt->bind_param("iiissii", $course_id, $year, $semester, $search_term, $search_term, $limit, $start);
-} else {
-    $modules_stmt->bind_param("iiiii", $course_id, $year, $semester, $limit, $start);
-}
+// Get all modules for this semester
+$modules_stmt = $conn->prepare("
+    SELECT 
+        m.*,
+        t.fullname as teacher_name
+    FROM modules m
+    LEFT JOIN teachers t ON m.teacher_id = t.teacher_id
+    WHERE m.course_id = ? AND m.year = ? AND m.semester = ? AND m.deleted = 0
+    ORDER BY m.module_code ASC
+");
+$modules_stmt->bind_param("iii", $course_id, $year, $semester);
 $modules_stmt->execute();
 $modules = $modules_stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $modules_stmt->close();
 
+// Get all teachers for dropdown
+$teachers = $conn->query("SELECT teacher_id, fullname FROM teachers WHERE status = 'active' AND deleted = 0 ORDER BY fullname ASC");
 ?>
-
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Manage Modules</title>
-    <link rel="stylesheet" href="../assets/css/auth.css">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Manage Modules - <?= htmlspecialchars($course['course_name']) ?></title>
     <style>
-        .auth-card {
-            width: 1000px;
-            max-width: 100%;
-            padding: 30px;
-            border-radius: 18px;
-            background: var(--white);
-            box-shadow: 0 20px 45px rgba(0,0,0,0.15);
-            margin: 30px auto;
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
 
-        h2 {
-            text-align: center;
-            margin-bottom: 15px;
-            color: var(--midnight-garden);
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f0f2f5;
+            color: #1e293b;
         }
 
-        .breadcrumb {
-            text-align: center;
-            font-size: 13px;
-            color: #666;
-            margin-bottom: 20px;
-        }
-
-        .alert {
-            padding: 12px;
-            margin: 15px 0;
-            border-radius: 8px;
-            display: none;
-        }
-
-        .alert.success {
-            background: #d4edda;
-            color: #155724;
-            display: block;
-            border: 1px solid #c3e6cb;
-        }
-
-        .alert.error {
-            background: #f8d7da;
-            color: #721c24;
-            display: block;
-            border: 1px solid #f5c6cb;
-        }
-
-        .search-box {
-            display: flex;
-            gap: 10px;
-            margin-bottom: 20px;
-            justify-content: center;
-            flex-wrap: wrap;
-        }
-
-        .search-box input {
-            padding: 8px 12px;
-            border: 1px solid #ddd;
-            border-radius: 8px;
-            font-size: 14px;
-            min-width: 300px;
-        }
-
-        .search-box button {
-            padding: 8px 15px;
-            background: var(--terra-rosa);
+        /* Header */
+        .header {
+            background: linear-gradient(135deg, #0f172a, #1e293b);
             color: white;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            font-weight: bold;
-        }
-
-        .search-box button:hover {
-            opacity: 0.9;
-        }
-
-        table {
+            padding: 1rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            position: sticky;
+            top: 0;
+            z-index: 100;
             width: 100%;
-            border-collapse: collapse;
-            margin-top: 20px;
-            table-layout: fixed;
         }
 
-        th, td {
-            padding: 10px;
-            border: 1px solid #566947;
-            text-align: center;
-            word-wrap: break-word;
+        .header h1 {
+            font-size: 1.8rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #2dd4bf, #14b8a6);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
         }
 
-        th {
-            background: var(--minty-fresh);
-            color: var(--art-craft);
-        }
-
-        td:first-child, th:first-child {
-            text-align: left;
-        }
-
-        a.action-link {
-            color: var(--terra-rosa);
-            font-weight: bold;
+        .header a {
+            color: white;
             text-decoration: none;
-            margin: 0 5px;
-            cursor: pointer;
+            padding: 0.5rem 1.2rem;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            transition: all 0.3s;
+            font-weight: 500;
         }
 
-        a.action-link:hover {
-            opacity: 0.8;
+        .header a:hover {
+            background: #2dd4bf;
+            transform: translateY(-2px);
         }
 
-        .auth-links {
-            text-align: center;
-            margin-top: 15px;
+        /* Container */
+        .container {
+            max-width: 1400px;
+            margin: 2rem auto;
+            padding: 0 2rem;
+        }
+
+        /* Breadcrumb */
+        .breadcrumb {
+            background: white;
+            padding: 1rem 1.5rem;
+            border-radius: 12px;
+            margin-bottom: 2rem;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+        }
+
+        .breadcrumb a {
+            color: #2dd4bf;
+            text-decoration: none;
+            font-weight: 500;
+        }
+
+        .breadcrumb a:hover {
+            text-decoration: underline;
+        }
+
+        /* Page Header */
+        .page-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+        }
+
+        .page-header h1 {
+            font-size: 2rem;
+            color: #0f172a;
         }
 
         .btn {
-            display: inline-block;
-            padding: 8px 15px;
-            background: linear-gradient(135deg, var(--terra-rosa), var(--honey-glow));
-            color: #fff;
-            border-radius: 12px;
-            text-decoration: none;
-            font-weight: bold;
-            margin-bottom: 10px;
+            padding: 0.8rem 1.8rem;
             border: none;
-            cursor: pointer;
-        }
-
-        .btn:hover {
-            opacity: 0.9;
-        }
-
-        .add-btn {
-            float: left;
-        }
-
-        .back-btn {
-            float: right;
-        }
-
-        .no-data {
-            text-align: center;
-            padding: 30px;
-            color: #666;
-        }
-
-        .pagination {
-            text-align: center;
-            margin-top: 20px;
-            padding: 10px;
-        }
-
-        .pagination a, .pagination span {
-            padding: 5px 10px;
-            margin: 0 3px;
-            border: 1px solid #ddd;
-            border-radius: 5px;
+            border-radius: 10px;
+            font-weight: 600;
             text-decoration: none;
-            color: #333;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            transition: all 0.3s;
+            cursor: pointer;
+            font-size: 0.95rem;
         }
 
-        .pagination a:hover {
-            background: #f0f0f0;
-        }
-
-        .pagination span.active {
-            background: var(--terra-rosa);
+        .btn-primary {
+            background: linear-gradient(135deg, #2dd4bf, #14b8a6);
             color: white;
-            border-color: var(--terra-rosa);
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 16px -4px rgba(45, 212, 191, 0.4);
+        }
+
+        .btn-secondary {
+            background: white;
+            color: #0f172a;
+            border: 1px solid #e2e8f0;
+        }
+
+        .btn-secondary:hover {
+            border-color: #2dd4bf;
+            background: #f8fafc;
+        }
+
+        .btn-warning {
+            background: #f59e0b;
+            color: white;
+        }
+
+        /* Alert */
+        .alert {
+            padding: 1rem;
+            border-radius: 8px;
+            margin-bottom: 1.5rem;
+        }
+
+        .alert.success {
+            background: #d1fae5;
+            color: #065f46;
+            border-left: 4px solid #10b981;
+        }
+
+        .alert.error {
+            background: #fee2e2;
+            color: #991b1b;
+            border-left: 4px solid #ef4444;
+        }
+
+        /* Form Card */
+        .form-card {
+            background: white;
+            border-radius: 20px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+
+        .form-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .form-group {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .form-group label {
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+            color: #0f172a;
+        }
+
+        .form-group input,
+        .form-group select {
+            padding: 0.8rem;
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 0.95rem;
+            transition: all 0.3s;
+        }
+
+        .form-group input:focus,
+        .form-group select:focus {
+            outline: none;
+            border-color: #2dd4bf;
+            box-shadow: 0 0 0 3px rgba(45, 212, 191, 0.1);
+        }
+
+        /* Module List */
+        .module-list {
+            background: white;
+            border-radius: 20px;
+            padding: 2rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+
+        .module-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem;
+            border-bottom: 1px solid #e2e8f0;
+        }
+
+        .module-item:last-child {
+            border-bottom: none;
+        }
+
+        .module-code {
+            font-weight: 700;
+            color: #2dd4bf;
+            min-width: 100px;
+        }
+
+        .module-info {
+            flex: 1;
+            margin-left: 1rem;
+        }
+
+        .module-name {
+            font-weight: 600;
+            color: #0f172a;
+        }
+
+        .module-teacher {
+            font-size: 0.85rem;
+            color: #64748b;
+            margin-top: 0.25rem;
+        }
+
+        .module-actions {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .btn-small {
+            padding: 0.4rem 1rem;
+            border: none;
+            border-radius: 6px;
+            font-weight: 500;
+            font-size: 0.85rem;
+            cursor: pointer;
+            text-decoration: none;
+            transition: all 0.3s;
+        }
+
+        .btn-edit {
+            background: #e2e8f0;
+            color: #0f172a;
+        }
+
+        .btn-edit:hover {
+            background: #cbd5e1;
+        }
+
+        .btn-delete {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        .btn-delete:hover {
+            background: #fecaca;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 3rem;
+            color: #64748b;
         }
 
         /* Modal */
         .modal {
             display: none;
             position: fixed;
-            z-index: 1000;
-            left: 0;
             top: 0;
+            left: 0;
             width: 100%;
             height: 100%;
-            background-color: rgba(0,0,0,0.4);
+            background: rgba(0, 0, 0, 0.5);
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
         }
 
         .modal.show {
             display: flex;
-            align-items: center;
-            justify-content: center;
         }
 
         .modal-content {
-            background-color: var(--white);
-            padding: 25px;
-            border-radius: 12px;
-            width: 90%;
+            background: white;
+            border-radius: 20px;
+            padding: 2rem;
             max-width: 500px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            width: 90%;
         }
 
         .modal-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 20px;
+            margin-bottom: 1.5rem;
         }
 
-        .modal-header h3 {
-            margin: 0;
-            color: var(--midnight-garden);
+        .modal-header h2 {
+            color: #0f172a;
         }
 
         .close-btn {
             background: none;
             border: none;
-            font-size: 24px;
+            font-size: 1.5rem;
             cursor: pointer;
-            color: #999;
+            color: #64748b;
         }
 
-        .close-btn:hover {
-            color: #000;
-        }
-
-        .form-group {
-            margin-bottom: 15px;
-        }
-
-        .form-group label {
-            display: block;
-            margin-bottom: 5px;
-            font-weight: bold;
-            color: var(--midnight-garden);
-        }
-
-        .form-group input,
-        .form-group select {
-            width: 100%;
-            padding: 8px;
-            border: 1px solid #ddd;
-            border-radius: 8px;
-            font-size: 14px;
-            box-sizing: border-box;
-        }
-
-        .form-group input:focus,
-        .form-group select:focus {
-            outline: none;
-            border-color: var(--terra-rosa);
-        }
-
-        .form-actions {
+        .modal-actions {
             display: flex;
-            gap: 10px;
-            margin-top: 20px;
-        }
-
-        .form-actions button {
-            flex: 1;
-            padding: 10px;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            font-weight: bold;
-        }
-
-        .btn-submit {
-            background: linear-gradient(135deg, var(--terra-rosa), var(--honey-glow));
-            color: white;
-        }
-
-        .btn-submit:hover {
-            opacity: 0.9;
-        }
-
-        .btn-cancel {
-            background: #999;
-            color: white;
-        }
-
-        .btn-cancel:hover {
-            opacity: 0.9;
+            gap: 1rem;
+            margin-top: 1.5rem;
         }
 
         @media (max-width: 768px) {
-            .auth-card {
-                width: 95%;
-                padding: 15px;
+            .container {
+                padding: 0 1rem;
             }
 
-            table {
-                font-size: 12px;
+            .form-grid {
+                grid-template-columns: 1fr;
             }
 
-            th, td {
-                padding: 8px;
-            }
-
-            .search-box {
+            .module-item {
                 flex-direction: column;
+                align-items: flex-start;
+                gap: 1rem;
             }
 
-            .search-box input {
-                min-width: 100%;
+            .module-info {
+                margin-left: 0;
             }
 
-            .add-btn, .back-btn {
-                float: none;
-                display: block;
+            .module-actions {
                 width: 100%;
-                text-align: center;
             }
 
-            .modal-content {
-                width: 95%;
+            .btn-small {
+                flex: 1;
+                text-align: center;
             }
         }
     </style>
 </head>
 <body>
 
-<div class="auth-card">
-    <h2>Manage Modules</h2>
+<div class="header">
+    <h1>CSMS Admin</h1>
+    <a href="logout.php">🚪 Logout</a>
+</div>
 
+<div class="container">
+    <!-- Breadcrumb -->
     <div class="breadcrumb">
-        <?= htmlspecialchars($course['course_name']) ?> | Year <?= $year ?> | Semester <?= $semester ?>
+        <a href="dashboard.php">Dashboard</a> > 
+        <a href="manage_course_structure.php?course_id=<?= $course_id ?>"><?= htmlspecialchars($course['course_name']) ?></a> > 
+        <a href="manage_semester.php?course_id=<?= $course_id ?>&year=<?= $year ?>&semester=<?= $semester ?>">Year <?= $year ?> - Semester <?= $semester ?></a> > 
+        <strong>Modules</strong>
+    </div>
+
+    <!-- Page Header -->
+    <div class="page-header">
+        <h1>📚 Manage Modules</h1>
+        <div>
+            <button onclick="openAddModal()" class="btn btn-primary">➕ Add Module</button>
+            <a href="manage_semester.php?course_id=<?= $course_id ?>&year=<?= $year ?>&semester=<?= $semester ?>" class="btn btn-secondary">← Back</a>
+        </div>
     </div>
 
     <?php if ($message): ?>
-        <div class="alert <?= $message_type === 'success' ? 'success' : 'error' ?>">
-            <?= htmlspecialchars($message) ?>
-        </div>
+        <div class="alert <?= $message_type ?>"><?= $message ?></div>
     <?php endif; ?>
 
-    <button onclick="openAddModal()" class="btn add-btn">+ Add Module</button>
-    <a href="manage_courses.php" class="btn back-btn">← Back</a>
-    <div style="clear: both;"></div>
-
-    <div class="search-box">
-        <form method="GET" style="display: flex; gap: 10px; width: 100%;">
-            <input type="hidden" name="course_id" value="<?= $course_id ?>">
-            <input type="hidden" name="year" value="<?= $year ?>">
-            <input type="hidden" name="semester" value="<?= $semester ?>">
-            <input type="text" name="search" placeholder="Search by code or name..." value="<?= htmlspecialchars($search) ?>">
-            <button type="submit">🔍 Search</button>
-            <?php if(!empty($search)): ?>
-                <a href="?course_id=<?= $course_id ?>&year=<?= $year ?>&semester=<?= $semester ?>" style="padding: 8px 15px; background: #999; color: white; text-decoration: none; border-radius: 8px;">Clear</a>
-            <?php endif; ?>
-        </form>
-    </div>
-
-    <?php if(count($modules) > 0): ?>
-        <table>
-            <tr>
-                <th>Code</th>
-                <th>Name</th>
-                <th>Teacher</th>
-                <th>Status</th>
-                <th>Actions</th>
-            </tr>
-
+    <!-- Modules List -->
+    <div class="module-list">
+        <h2 style="margin-bottom: 1.5rem;">Current Modules (<?= count($modules) ?>)</h2>
+        
+        <?php if (count($modules) > 0): ?>
             <?php foreach ($modules as $module): ?>
-            <tr>
-                <td><?= htmlspecialchars($module['module_code']) ?></td>
-                <td><?= htmlspecialchars($module['module_name']) ?></td>
-                <td><?= htmlspecialchars($module['teacher_name'] ?? 'Unassigned') ?></td>
-                <td><?= $module['status'] === 'active' ? '✓ Active' : '⚠️ Inactive' ?></td>
-                <td>
-                    <a class="action-link" onclick="openEditModal(<?= htmlspecialchars(json_encode($module)) ?>)">Edit</a>
-                    <form method="POST" style="display: inline;">
-                        <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+            <div class="module-item">
+                <div class="module-code"><?= htmlspecialchars($module['module_code']) ?></div>
+                <div class="module-info">
+                    <div class="module-name"><?= htmlspecialchars($module['module_name']) ?></div>
+                    <div class="module-teacher">Teacher: <?= htmlspecialchars($module['teacher_name'] ?? 'Not Assigned') ?></div>
+                </div>
+                <div class="module-actions">
+                    <button onclick="openEditModal(<?= htmlspecialchars(json_encode($module)) ?>)" class="btn-small btn-edit">Edit</button>
+                    <form method="POST" style="display: inline;" onsubmit="return confirm('Move this module to recycle bin?')">
+                        <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
                         <input type="hidden" name="action" value="delete">
                         <input type="hidden" name="module_id" value="<?= $module['module_id'] ?>">
-                        <a class="action-link" onclick="if(confirm('Delete this module?')) this.parentForm.submit(); return false;">Delete</a>
+                        <button type="submit" class="btn-small btn-delete">Delete</button>
                     </form>
-                </td>
-            </tr>
+                </div>
+            </div>
             <?php endforeach; ?>
-        </table>
-
-        <?php if($pages > 1): ?>
-            <div class="pagination">
-                <?php if ($page > 1): ?>
-                    <a href="?course_id=<?= $course_id ?>&year=<?= $year ?>&semester=<?= $semester ?>&page=1<?= !empty($search) ? '&search=' . urlencode($search) : '' ?>">« First</a>
-                    <a href="?course_id=<?= $course_id ?>&year=<?= $year ?>&semester=<?= $semester ?>&page=<?= $page - 1 ?><?= !empty($search) ? '&search=' . urlencode($search) : '' ?>">‹ Previous</a>
-                <?php endif; ?>
-
-                <?php for ($i = max(1, $page - 2); $i <= min($pages, $page + 2); $i++): ?>
-                    <?php if ($i === $page): ?>
-                        <span class="active"><?= $i ?></span>
-                    <?php else: ?>
-                        <a href="?course_id=<?= $course_id ?>&year=<?= $year ?>&semester=<?= $semester ?>&page=<?= $i ?><?= !empty($search) ? '&search=' . urlencode($search) : '' ?>"><?= $i ?></a>
-                    <?php endif; ?>
-                <?php endfor; ?>
-
-                <?php if ($page < $pages): ?>
-                    <a href="?course_id=<?= $course_id ?>&year=<?= $year ?>&semester=<?= $semester ?>&page=<?= $page + 1 ?><?= !empty($search) ? '&search=' . urlencode($search) : '' ?>">Next ›</a>
-                    <a href="?course_id=<?= $course_id ?>&year=<?= $year ?>&semester=<?= $semester ?>&page=<?= $pages ?><?= !empty($search) ? '&search=' . urlencode($search) : '' ?>">Last »</a>
-                <?php endif; ?>
+        <?php else: ?>
+            <div class="empty-state">
+                <p>No modules found for this semester.</p>
+                <button onclick="openAddModal()" class="btn btn-primary" style="margin-top: 1rem;">➕ Add Your First Module</button>
             </div>
         <?php endif; ?>
-    <?php else: ?>
-        <div class="no-data">
-            <p>No modules found.</p>
-        </div>
-    <?php endif; ?>
-
-    <div class="auth-links">
-        <a href="manage_courses.php">Back to Dashboard</a>
     </div>
 </div>
 
-<!-- Modal -->
+<!-- Add/Edit Module Modal -->
 <div id="moduleModal" class="modal">
     <div class="modal-content">
         <div class="modal-header">
-            <h3 id="modalTitle">Add Module</h3>
-            <button class="close-btn" onclick="closeModal()">×</button>
+            <h2 id="modalTitle">Add Module</h2>
+            <button class="close-btn" onclick="closeModal()">&times;</button>
         </div>
 
         <form id="moduleForm" method="POST">
-            <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+            <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
             <input type="hidden" name="action" id="formAction" value="add">
             <input type="hidden" name="module_id" id="moduleId" value="">
 
@@ -623,15 +587,15 @@ $modules_stmt->close();
             </div>
 
             <div class="form-group">
-                <label for="teacher">Teacher *</label>
-                <select id="teacher" name="teacher_id" required>
-                    <option value="">-- Select --</option>
+                <label for="teacher">Assign Teacher</label>
+                <select id="teacher" name="teacher_id">
+                    <option value="0">-- Not Assigned --</option>
                     <?php 
                     $teachers->data_seek(0);
-                    while ($t = $teachers->fetch_assoc()): 
+                    while ($teacher = $teachers->fetch_assoc()): 
                     ?>
-                        <option value="<?= $t['teacher_id'] ?>">
-                            <?= htmlspecialchars($t['fullname']) ?>
+                        <option value="<?= $teacher['teacher_id'] ?>">
+                            <?= htmlspecialchars($teacher['fullname']) ?>
                         </option>
                     <?php endwhile; ?>
                 </select>
@@ -645,9 +609,9 @@ $modules_stmt->close();
                 </select>
             </div>
 
-            <div class="form-actions">
-                <button type="submit" class="btn-submit">Save</button>
-                <button type="button" class="btn-cancel" onclick="closeModal()">Cancel</button>
+            <div class="modal-actions">
+                <button type="submit" class="btn btn-primary">Save</button>
+                <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
             </div>
         </form>
     </div>
@@ -660,7 +624,7 @@ function openAddModal() {
     document.getElementById('moduleId').value = '';
     document.getElementById('moduleCode').value = '';
     document.getElementById('moduleName').value = '';
-    document.getElementById('teacher').value = '';
+    document.getElementById('teacher').value = '0';
     document.getElementById('statusGroup').style.display = 'none';
     document.getElementById('moduleModal').classList.add('show');
 }
@@ -671,7 +635,7 @@ function openEditModal(module) {
     document.getElementById('moduleId').value = module.module_id;
     document.getElementById('moduleCode').value = module.module_code;
     document.getElementById('moduleName').value = module.module_name;
-    document.getElementById('teacher').value = module.teacher_id;
+    document.getElementById('teacher').value = module.teacher_id || '0';
     document.getElementById('status').value = module.status;
     document.getElementById('statusGroup').style.display = 'block';
     document.getElementById('moduleModal').classList.add('show');

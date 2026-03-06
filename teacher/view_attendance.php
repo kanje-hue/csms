@@ -1,316 +1,421 @@
 <?php
-session_start();
-include '../config/db.php';
+/**
+ * teacher/view_attendance.php - View Attendance Report
+ * Shows attendance statistics and exam eligibility
+ */
 
-if(!isset($_SESSION['teacher_id'])){
+session_start();
+require_once '../config/db.php';
+require_once '../config/security.php';
+require_once '../config/security_base.php';
+
+// Check teacher login
+if (!isset($_SESSION['teacher_logged_in']) || !isset($_SESSION['teacher_id'])) {
     header("Location: login.php");
     exit();
 }
 
 $teacher_id = $_SESSION['teacher_id'];
-$module_id = isset($_GET['module_id']) ? (int)$_GET['module_id'] : null;
+$module_id = isset($_GET['module_id']) ? (int)$_GET['module_id'] : 0;
 
-if(!$module_id){
-    die("Module not specified");
+if (!$module_id) {
+    header("Location: dashboard.php");
+    exit();
 }
 
-// Verify teacher owns module
-$check = $conn->prepare("SELECT m.module_id, m.module_code, m.module_name, c.course_id, c.course_name, m.year, m.semester 
-                         FROM modules m
-                         LEFT JOIN courses c ON m.course_id = c.course_id
-                         WHERE m.module_id = ? AND m.teacher_id = ? AND m.deleted = 0");
-$check->bind_param("ii", $module_id, $teacher_id);
-$check->execute();
-$module_result = $check->get_result();
+// Verify teacher owns this module
+$check_stmt = $conn->prepare("
+    SELECT m.*, c.course_name 
+    FROM modules m
+    JOIN courses c ON m.course_id = c.course_id
+    WHERE m.module_id = ? AND m.teacher_id = ? AND m.deleted = 0
+");
+$check_stmt->bind_param("ii", $module_id, $teacher_id);
+$check_stmt->execute();
+$module_result = $check_stmt->get_result();
 
-if($module_result->num_rows == 0){
+if ($module_result->num_rows == 0) {
     die("❌ Unauthorized: This module is not assigned to you");
 }
 
 $module = $module_result->fetch_assoc();
-$check->close();
+$check_stmt->close();
 
-// Get enrolled students with attendance data
-$students_query = "
+// Get attendance records
+$attendance_query = "
     SELECT 
+        a.*,
         s.student_id,
         s.reg_number,
-        s.name,
-        COUNT(DISTINCT ba.attendance_date) as classes_present,
-        (SELECT COUNT(DISTINCT attendance_date) FROM biometric_attendance 
-         WHERE student_id = s.student_id) as total_attendance_records
+        s.name as student_name,
+        s.email
     FROM module_enrollments me
-    INNER JOIN students s ON me.student_id = s.student_id
-    LEFT JOIN biometric_attendance ba ON s.student_id = ba.student_id AND ba.status IN ('present', 'late')
+    JOIN students s ON me.student_id = s.student_id
+    LEFT JOIN attendance a ON a.student_id = s.student_id AND a.module_id = ?
     WHERE me.module_id = ? AND s.deleted = 0 AND s.status = 'active'
-    GROUP BY s.student_id, s.reg_number, s.name
     ORDER BY s.name ASC
 ";
 
-$students_stmt = $conn->prepare($students_query);
-$students_stmt->bind_param("i", $module_id);
-$students_stmt->execute();
-$students = $students_stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-$students_stmt->close();
+$attendance_stmt = $conn->prepare($attendance_query);
+$attendance_stmt->bind_param("ii", $module_id, $module_id);
+$attendance_stmt->execute();
+$attendance_records = $attendance_stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$attendance_stmt->close();
 
-// Calculate total classes held
-$classes_query = "SELECT COUNT(DISTINCT attendance_date) as total_classes FROM biometric_attendance";
-$classes_stmt = $conn->prepare($classes_query);
-$classes_stmt->execute();
-$classes_result = $classes_stmt->get_result()->fetch_assoc();
-$total_classes = $classes_result['total_classes'] ?? 0;
-$classes_stmt->close();
+// Calculate statistics
+$total_students = count($attendance_records);
+$students_with_attendance = count(array_filter($attendance_records, fn($a) => $a['attended_classes'] !== null));
+$eligible_count = count(array_filter($attendance_records, fn($a) => ($a['is_eligible'] ?? 0) == 1));
+$published = count(array_filter($attendance_records, fn($a) => ($a['status'] ?? 'draft') === 'published')) > 0;
 
+// Calculate average attendance
+$total_percentage = 0;
+$count_with_percentage = 0;
+foreach ($attendance_records as $record) {
+    if ($record['attendance_percentage'] !== null) {
+        $total_percentage += $record['attendance_percentage'];
+        $count_with_percentage++;
+    }
+}
+$avg_attendance = $count_with_percentage > 0 ? $total_percentage / $count_with_percentage : 0;
 ?>
-
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Attendance Report - <?= htmlspecialchars($module['module_code']) ?></title>
-    <link rel="stylesheet" href="../assets/css/auth.css">
     <style>
-        .auth-card {
-            width: 1200px;
-            max-width: 100%;
-            padding: 30px;
-            border-radius: 18px;
-            background: var(--white);
-            box-shadow: 0 20px 45px rgba(0,0,0,0.15);
-            margin: 30px auto;
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
 
-        h2 {
-            text-align: center;
-            color: var(--midnight-garden);
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f0f2f5;
+            color: #1e293b;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #0f172a, #1e293b);
+            color: white;
+            padding: 1rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            width: 100%;
+        }
+
+        .header h1 {
+            font-size: 1.8rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #2dd4bf, #14b8a6);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .header a {
+            color: white;
+            text-decoration: none;
+            padding: 0.5rem 1.2rem;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            transition: all 0.3s;
+        }
+
+        .header a:hover {
+            background: #2dd4bf;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 2rem auto;
+            padding: 0 2rem;
         }
 
         .module-info {
-            background: linear-gradient(135deg, var(--terra-rosa), var(--honey-glow));
+            background: linear-gradient(135deg, #0f172a, #1e293b);
             color: white;
-            padding: 20px;
-            border-radius: 10px;
-            margin-bottom: 20px;
+            padding: 2rem;
+            border-radius: 20px;
+            margin-bottom: 2rem;
         }
 
-        .module-info strong {
-            display: block;
-            font-size: 18px;
-            margin-bottom: 5px;
+        .module-info h2 {
+            font-size: 1.8rem;
+            margin-bottom: 0.5rem;
         }
 
-        .stats {
+        .module-info p {
+            color: #94a3b8;
+        }
+
+        .stats-grid {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 15px;
-            margin: 20px 0;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
         }
 
         .stat-card {
-            background: linear-gradient(135deg, var(--minty-fresh), #a8d5ba);
-            color: var(--art-craft);
-            padding: 20px;
-            border-radius: 8px;
-            text-align: center;
+            background: white;
+            padding: 1.5rem;
+            border-radius: 16px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            border-left: 4px solid #2dd4bf;
         }
 
         .stat-number {
-            font-size: 28px;
-            font-weight: bold;
+            font-size: 2rem;
+            font-weight: 700;
+            color: #0f172a;
         }
 
         .stat-label {
-            font-size: 12px;
-            margin-top: 5px;
-            opacity: 0.9;
+            color: #64748b;
+            font-size: 0.9rem;
+            margin-top: 0.25rem;
         }
 
-        h3 {
-            margin-top: 30px;
-            margin-bottom: 15px;
-            color: var(--midnight-garden);
-            border-bottom: 2px solid var(--minty-fresh);
-            padding-bottom: 10px;
+        .summary-card {
+            background: white;
+            border-radius: 16px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+
+        .eligibility-summary {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 2rem;
+            margin-top: 1rem;
+        }
+
+        .eligibility-item {
+            text-align: center;
+            padding: 1.5rem;
+            border-radius: 12px;
+        }
+
+        .eligibility-item.eligible {
+            background: #d1fae5;
+        }
+
+        .eligibility-item.not-eligible {
+            background: #fee2e2;
+        }
+
+        .eligibility-number {
+            font-size: 3rem;
+            font-weight: 700;
+        }
+
+        .eligibility-label {
+            font-size: 1rem;
+            color: #475569;
+            margin-top: 0.5rem;
         }
 
         table {
             width: 100%;
             border-collapse: collapse;
-            margin-top: 20px;
-        }
-
-        th, td {
-            padding: 12px;
-            border: 1px solid #ddd;
-            text-align: left;
+            background: white;
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
         }
 
         th {
-            background: var(--minty-fresh);
-            color: var(--art-craft);
-            font-weight: bold;
+            background: #f8fafc;
+            padding: 1rem;
+            text-align: left;
+            font-weight: 600;
+            color: #0f172a;
+            border-bottom: 2px solid #e2e8f0;
         }
 
-        tr:nth-child(even) {
-            background: #f9f9f9;
+        td {
+            padding: 1rem;
+            border-bottom: 1px solid #e2e8f0;
         }
 
         tr:hover {
-            background: #f0f0f0;
+            background: #f8fafc;
         }
 
-        .percentage {
-            font-weight: bold;
-            text-align: center;
+        .eligibility-badge {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
         }
 
         .eligible {
-            color: #4CAF50;
+            background: #d1fae5;
+            color: #065f46;
         }
 
         .not-eligible {
-            color: #f44336;
+            background: #fee2e2;
+            color: #991b1b;
         }
 
-        .badge {
+        .status-badge {
             display: inline-block;
-            padding: 4px 12px;
-            border-radius: 12px;
-            font-size: 12px;
-            font-weight: bold;
-            text-align: center;
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
         }
 
-        .badge-eligible {
-            background: #d4edda;
-            color: #155724;
+        .status-published {
+            background: #d1fae5;
+            color: #065f46;
         }
 
-        .badge-not-eligible {
-            background: #f8d7da;
-            color: #721c24;
+        .status-draft {
+            background: #fef3c7;
+            color: #92400e;
         }
 
         .back-link {
+            margin-top: 2rem;
             text-align: center;
-            margin-top: 30px;
-        }
-
-        .back-link a {
-            color: var(--terra-rosa);
-            text-decoration: none;
-            font-weight: bold;
-            padding: 10px 20px;
-            border: 2px solid var(--terra-rosa);
-            border-radius: 8px;
-            display: inline-block;
-        }
-
-        .back-link a:hover {
-            background: var(--terra-rosa);
-            color: white;
-        }
-
-        .no-data {
-            text-align: center;
-            padding: 40px;
-            color: #666;
         }
 
         @media (max-width: 768px) {
-            .auth-card {
-                width: 95%;
-                padding: 15px;
+            .container {
+                padding: 0 1rem;
             }
 
-            .stats {
+            .eligibility-summary {
                 grid-template-columns: 1fr;
             }
 
             table {
-                font-size: 12px;
+                font-size: 0.8rem;
             }
 
-            th, td {
-                padding: 8px;
+            td, th {
+                padding: 0.5rem;
             }
         }
     </style>
 </head>
 <body>
 
-<div class="auth-card">
-    <h2>📊 Attendance & Exam Eligibility Report</h2>
+<div class="header">
+    <h1>CSMS Teacher</h1>
+    <a href="manage_attendance.php?module_id=<?= $module_id ?>">← Manage Attendance</a>
+    <a href="logout.php">🚪 Logout</a>
+</div>
 
+<div class="container">
+    <!-- Module Info -->
     <div class="module-info">
-        <strong><?= htmlspecialchars($module['module_code']) ?> - <?= htmlspecialchars($module['module_name']) ?></strong>
-        <small><?= htmlspecialchars($module['course_name']) ?> | Year <?= $module['year'] ?> | Semester <?= $module['semester'] ?></small>
+        <h2><?= htmlspecialchars($module['module_code']) ?> - <?= htmlspecialchars($module['module_name']) ?></h2>
+        <p><?= htmlspecialchars($module['course_name']) ?> | Year <?= $module['year'] ?> | Semester <?= $module['semester'] ?></p>
     </div>
 
-    <div class="stats">
+    <!-- Statistics -->
+    <div class="stats-grid">
         <div class="stat-card">
-            <div class="stat-number"><?= count($students) ?></div>
-            <div class="stat-label">Total Students Enrolled</div>
+            <div class="stat-number"><?= $total_students ?></div>
+            <div class="stat-label">Total Students</div>
         </div>
         <div class="stat-card">
-            <div class="stat-number"><?= $total_classes ?></div>
-            <div class="stat-label">Total Classes Held</div>
+            <div class="stat-number"><?= $students_with_attendance ?></div>
+            <div class="stat-label">Attendance Uploaded</div>
         </div>
         <div class="stat-card">
-            <div class="stat-number">
-                <?php 
-                    $eligible_count = 0;
-                    foreach ($students as $s) {
-                        $percentage = $total_classes > 0 ? ($s['classes_present'] / $total_classes) * 100 : 0;
-                        if ($percentage >= 60) $eligible_count++;
-                    }
-                    echo $eligible_count;
-                ?>
+            <div class="stat-number"><?= number_format($avg_attendance, 1) ?>%</div>
+            <div class="stat-label">Average Attendance</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number"><?= $published ? '✓ Published' : '📝 Draft' ?></div>
+            <div class="stat-label">Status</div>
+        </div>
+    </div>
+
+    <!-- Eligibility Summary -->
+    <div class="summary-card">
+        <h3 style="margin-bottom: 1rem;">📊 Exam Eligibility Summary</h3>
+        <div class="eligibility-summary">
+            <div class="eligibility-item eligible">
+                <div class="eligibility-number"><?= $eligible_count ?></div>
+                <div class="eligibility-label">Students Eligible (≥60%)</div>
             </div>
-            <div class="stat-label">Students Eligible (60%+)</div>
+            <div class="eligibility-item not-eligible">
+                <div class="eligibility-number"><?= $total_students - $eligible_count ?></div>
+                <div class="eligibility-label">Students Not Eligible</div>
+            </div>
         </div>
     </div>
 
-    <h3>Student Attendance Details</h3>
-
-    <?php if (count($students) > 0): ?>
-        <table>
-            <thead>
-                <tr>
-                    <th>Reg Number</th>
-                    <th>Student Name</th>
-                    <th>Classes Present</th>
-                    <th>Total Classes</th>
-                    <th>Attendance %</th>
-                    <th>Exam Eligible?</th>
-                </tr>
-            </thead>
-            <tbody>
-                <?php foreach ($students as $student): 
-                    $present = $student['classes_present'] ?? 0;
-                    $percentage = $total_classes > 0 ? round(($present / $total_classes) * 100, 2) : 0;
-                    $is_eligible = $percentage >= 60;
-                    $badge_class = $is_eligible ? 'badge-eligible' : 'badge-not-eligible';
-                    $badge_text = $is_eligible ? '✓ Eligible' : '❌ Not Eligible';
-                ?>
-                <tr>
-                    <td><strong><?= htmlspecialchars($student['reg_number']) ?></strong></td>
-                    <td><?= htmlspecialchars($student['name']) ?></td>
-                    <td><?= $present ?></td>
-                    <td><?= $total_classes ?></td>
-                    <td class="percentage <?= $is_eligible ? 'eligible' : 'not-eligible' ?>"><?= $percentage ?>%</td>
-                    <td><span class="badge <?= $badge_class ?>"><?= $badge_text ?></span></td>
-                </tr>
-                <?php endforeach; ?>
-            </tbody>
-        </table>
-    <?php else: ?>
-        <div class="no-data">
-            <p>❌ No students are enrolled in this module</p>
-        </div>
-    <?php endif; ?>
+    <!-- Detailed Attendance -->
+    <h3 style="margin: 2rem 0 1rem;">📋 Detailed Attendance Records</h3>
+    
+    <table>
+        <thead>
+            <tr>
+                <th>Reg Number</th>
+                <th>Student Name</th>
+                <th>Total Classes</th>
+                <th>Attended</th>
+                <th>Percentage</th>
+                <th>Eligibility</th>
+                <th>Status</th>
+            </tr>
+        </thead>
+        <tbody>
+            <?php foreach ($attendance_records as $record): 
+                $percentage = $record['attendance_percentage'] ?? 0;
+                $eligible = ($record['is_eligible'] ?? 0) == 1;
+            ?>
+            <tr>
+                <td><strong><?= htmlspecialchars($record['reg_number']) ?></strong></td>
+                <td><?= htmlspecialchars($record['student_name']) ?></td>
+                <td><?= $record['total_classes'] ?? '-' ?></td>
+                <td><?= $record['attended_classes'] ?? '-' ?></td>
+                <td>
+                    <?php if ($record['attended_classes'] !== null): ?>
+                        <?= number_format($percentage, 1) ?>%
+                    <?php else: ?>
+                        -
+                    <?php endif; ?>
+                </td>
+                <td>
+                    <?php if ($record['attended_classes'] !== null): ?>
+                        <span class="eligibility-badge <?= $eligible ? 'eligible' : 'not-eligible' ?>">
+                            <?= $eligible ? '✓ Eligible' : '❌ Not Eligible' ?>
+                        </span>
+                    <?php else: ?>
+                        <span class="eligibility-badge not-eligible">Not Uploaded</span>
+                    <?php endif; ?>
+                </td>
+                <td>
+                    <?php if ($record['status'] ?? 'draft'): ?>
+                        <span class="status-badge status-<?= $record['status'] ?? 'draft' ?>">
+                            <?= ucfirst($record['status'] ?? 'draft') ?>
+                        </span>
+                    <?php endif; ?>
+                </td>
+            </tr>
+            <?php endforeach; ?>
+        </tbody>
+    </table>
 
     <div class="back-link">
-        <a href="dashboard.php">← Back to Dashboard</a>
+        <a href="manage_attendance.php?module_id=<?= $module_id ?>">← Back to Attendance Management</a>
     </div>
 </div>
 

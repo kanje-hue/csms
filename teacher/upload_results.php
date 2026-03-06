@@ -1,96 +1,118 @@
 <?php
-session_start();
-include '../config/db.php';
+/**
+ * teacher/upload_results.php - Upload and Manage Student Results
+ * Features: CSV upload, manual entry, grade calculation, supplementary detection
+ */
 
-if(!isset($_SESSION['teacher_id'])){
+session_start();
+require_once '../config/db.php';
+require_once '../config/security_base.php';
+
+// Check teacher login
+if (!isset($_SESSION['teacher_logged_in']) || !isset($_SESSION['teacher_id'])) {
     header("Location: login.php");
     exit();
 }
 
 $teacher_id = $_SESSION['teacher_id'];
-$module_id = isset($_GET['module_id']) ? (int)$_GET['module_id'] : null;
+$module_id = isset($_GET['module_id']) ? (int)$_GET['module_id'] : 0;
 
-if(!$module_id){
-    die("Module not specified");
+if (!$module_id) {
+    header("Location: dashboard.php");
+    exit();
 }
 
-// Verify teacher owns module
-$check = $conn->prepare("SELECT m.module_id, m.module_code, m.module_name, c.course_id, c.course_name, m.year, m.semester 
-                         FROM modules m
-                         LEFT JOIN courses c ON m.course_id = c.course_id
-                         WHERE m.module_id = ? AND m.teacher_id = ? AND m.deleted = 0");
-$check->bind_param("ii", $module_id, $teacher_id);
-$check->execute();
-$module_result = $check->get_result();
+// Verify teacher owns this module
+$check_stmt = $conn->prepare("
+    SELECT m.*, c.course_name, c.course_id 
+    FROM modules m
+    JOIN courses c ON m.course_id = c.course_id
+    WHERE m.module_id = ? AND m.teacher_id = ? AND m.deleted = 0
+");
+$check_stmt->bind_param("ii", $module_id, $teacher_id);
+$check_stmt->execute();
+$module_result = $check_stmt->get_result();
 
-if($module_result->num_rows == 0){
-    die("❌ Unauthorized");
+if ($module_result->num_rows == 0) {
+    die("❌ Unauthorized: This module is not assigned to you");
 }
 
 $module = $module_result->fetch_assoc();
-$check->close();
+$check_stmt->close();
 
-$course_id = $module['course_id'];
 $message = "";
 $message_type = "";
+$csrf_token = generateCSRF();
 
-// Handle CSV upload
-if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'upload_csv'){
-    if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
-        $message = "Security token verification failed";
-        $message_type = "error";
-    } elseif(!isset($_FILES['csv_file']) || $_FILES['csv_file']['error'] !== UPLOAD_ERR_OK){
+// Handle CSV Upload
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'upload_csv') {
+    validateCSRF($_POST['csrf_token'] ?? '');
+    
+    if (!isset($_FILES['csv_file']) || $_FILES['csv_file']['error'] !== UPLOAD_ERR_OK) {
         $message = "Error uploading file";
         $message_type = "error";
     } else {
         $file = $_FILES['csv_file'];
+        $file_ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
         
-        // Validate file type
-        if($file['type'] !== 'text/csv' && $file['type'] !== 'text/plain'){
+        if ($file_ext !== 'csv') {
             $message = "Only CSV files are allowed";
             $message_type = "error";
         } else {
             $handle = fopen($file['tmp_name'], 'r');
             $row_count = 0;
             $success_count = 0;
-            $error_details = [];
+            $errors = [];
             
             while (($data = fgetcsv($handle, 1000, ",")) !== FALSE) {
                 $row_count++;
                 
-                // Skip header
-                if($row_count === 1) continue;
+                // Skip header row
+                if ($row_count === 1 && strtolower($data[0]) === 'reg_number') {
+                    continue;
+                }
                 
-                if(count($data) < 3) continue;
+                if (count($data) < 3) {
+                    $errors[] = "Row $row_count: Invalid format";
+                    continue;
+                }
                 
                 $reg_number = trim($data[0]);
-                $ca_marks = floatval(trim($data[1]));
-                $final_marks = floatval(trim($data[2]));
+                $ca_marks = floatval($data[1]);
+                $final_marks = floatval($data[2]);
                 
                 // Validate marks
-                if($ca_marks < 0 || $ca_marks > 60 || $final_marks < 0 || $final_marks > 40){
-                    $error_details[] = "Row $row_count: Invalid marks (CA: 0-60, Final: 0-40)";
+                if ($ca_marks < 0 || $ca_marks > 60) {
+                    $errors[] = "Row $row_count: CA marks must be between 0-60";
+                    continue;
+                }
+                if ($final_marks < 0 || $final_marks > 40) {
+                    $errors[] = "Row $row_count: Final marks must be between 0-40";
                     continue;
                 }
                 
                 // Get student ID
-                $student_stmt = $conn->prepare("SELECT student_id FROM students WHERE reg_number = ? AND course_id = ? AND deleted = 0");
-                $student_stmt->bind_param("si", $reg_number, $course_id);
+                $student_stmt = $conn->prepare("
+                    SELECT s.student_id 
+                    FROM students s
+                    JOIN module_enrollments me ON s.student_id = me.student_id
+                    WHERE s.reg_number = ? AND me.module_id = ? AND s.deleted = 0
+                ");
+                $student_stmt->bind_param("si", $reg_number, $module_id);
                 $student_stmt->execute();
                 $student_result = $student_stmt->get_result();
                 
-                if($student_result->num_rows > 0){
+                if ($student_result->num_rows > 0) {
                     $student = $student_result->fetch_assoc();
                     $student_id = $student['student_id'];
                     $total_marks = $ca_marks + $final_marks;
                     
-                    // Get grade
-                    $grade_stmt = $conn->prepare("SELECT grade_name FROM grade_configuration WHERE course_id = ? AND ? BETWEEN min_marks AND max_marks LIMIT 1");
-                    $grade_stmt->bind_param("id", $course_id, $total_marks);
-                    $grade_stmt->execute();
-                    $grade_result = $grade_stmt->get_result();
-                    $grade = $grade_result->num_rows > 0 ? $grade_result->fetch_assoc()['grade_name'] : 'F';
-                    $grade_stmt->close();
+                    // Determine grade based on total marks
+                    if ($total_marks >= 70) $grade = 'A';
+                    elseif ($total_marks >= 60) $grade = 'B';
+                    elseif ($total_marks >= 50) $grade = 'C';
+                    elseif ($total_marks >= 40) $grade = 'D';
+                    else $grade = 'F';
                     
                     // Insert or update result
                     $insert_stmt = $conn->prepare("
@@ -105,88 +127,91 @@ if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['a
                     ");
                     $insert_stmt->bind_param("iiddds", $student_id, $module_id, $ca_marks, $final_marks, $total_marks, $grade);
                     
-                    if($insert_stmt->execute()){
+                    if ($insert_stmt->execute()) {
                         $success_count++;
+                    } else {
+                        $errors[] = "Row $row_count: Database error";
                     }
                     $insert_stmt->close();
                 } else {
-                    $error_details[] = "Row $row_count: Student $reg_number not found";
+                    $errors[] = "Row $row_count: Student $reg_number not found in this module";
                 }
-                
                 $student_stmt->close();
             }
             
             fclose($handle);
             
-            $message = "✓ Uploaded $success_count marks successfully!";
-            $message_type = "success";
-            
-            if(!empty($error_details)){
-                $message .= " (" . count($error_details) . " errors)";
-            }
-        }
-    }
-}
-
-// Handle manual entry
-if($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'save_marks'){
-    if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
-        $message = "Security token verification failed";
-        $message_type = "error";
-    } else {
-        $student_id = (int)($_POST['student_id'] ?? 0);
-        $ca_marks = floatval($_POST['ca_marks'] ?? 0);
-        $final_marks = floatval($_POST['final_marks'] ?? 0);
-        
-        // Validate
-        if($student_id <= 0 || $ca_marks < 0 || $ca_marks > 60 || $final_marks < 0 || $final_marks > 40){
-            $message = "Invalid marks or student";
-            $message_type = "error";
-        } else {
-            $total_marks = $ca_marks + $final_marks;
-            
-            // Get grade
-            $grade_stmt = $conn->prepare("SELECT grade_name FROM grade_configuration WHERE course_id = ? AND ? BETWEEN min_marks AND max_marks LIMIT 1");
-            $grade_stmt->bind_param("id", $course_id, $total_marks);
-            $grade_stmt->execute();
-            $grade_result = $grade_stmt->get_result();
-            $grade = $grade_result->num_rows > 0 ? $grade_result->fetch_assoc()['grade_name'] : 'F';
-            $grade_stmt->close();
-            
-            // Insert or update
-            $stmt = $conn->prepare("
-                INSERT INTO results (student_id, module_id, ca_marks, final_marks, total_marks, grade, status)
-                VALUES (?, ?, ?, ?, ?, ?, 'draft')
-                ON DUPLICATE KEY UPDATE 
-                    ca_marks = VALUES(ca_marks),
-                    final_marks = VALUES(final_marks),
-                    total_marks = VALUES(total_marks),
-                    grade = VALUES(grade)
-            ");
-            $stmt->bind_param("iiddds", $student_id, $module_id, $ca_marks, $final_marks, $total_marks, $grade);
-            
-            if($stmt->execute()){
-                $message = "✓ Marks saved successfully!";
+            if ($success_count > 0) {
+                $message = "✓ Successfully uploaded $success_count student results!";
+                if (!empty($errors)) {
+                    $message .= " (" . count($errors) . " errors)";
+                }
                 $message_type = "success";
             } else {
-                $message = "Error saving marks";
+                $message = "No results were uploaded. Please check your CSV format.";
                 $message_type = "error";
             }
-            $stmt->close();
         }
     }
 }
 
-if (empty($_SESSION['csrf_token'])) {
-    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+// Handle Manual Save
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'save_marks') {
+    validateCSRF($_POST['csrf_token'] ?? '');
+    
+    $student_id = (int)($_POST['student_id'] ?? 0);
+    $ca_marks = floatval($_POST['ca_marks'] ?? 0);
+    $final_marks = floatval($_POST['final_marks'] ?? 0);
+    
+    if ($student_id <= 0) {
+        $message = "Invalid student selection";
+        $message_type = "error";
+    } elseif ($ca_marks < 0 || $ca_marks > 60) {
+        $message = "CA marks must be between 0-60";
+        $message_type = "error";
+    } elseif ($final_marks < 0 || $final_marks > 40) {
+        $message = "Final marks must be between 0-40";
+        $message_type = "error";
+    } else {
+        $total_marks = $ca_marks + $final_marks;
+        
+        // Determine grade
+        if ($total_marks >= 70) $grade = 'A';
+        elseif ($total_marks >= 60) $grade = 'B';
+        elseif ($total_marks >= 50) $grade = 'C';
+        elseif ($total_marks >= 40) $grade = 'D';
+        else $grade = 'F';
+        
+        // Insert or update
+        $stmt = $conn->prepare("
+            INSERT INTO results (student_id, module_id, ca_marks, final_marks, total_marks, grade, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'draft')
+            ON DUPLICATE KEY UPDATE 
+                ca_marks = VALUES(ca_marks),
+                final_marks = VALUES(final_marks),
+                total_marks = VALUES(total_marks),
+                grade = VALUES(grade)
+        ");
+        $stmt->bind_param("iiddds", $student_id, $module_id, $ca_marks, $final_marks, $total_marks, $grade);
+        
+        if ($stmt->execute()) {
+            $message = "✓ Marks saved successfully!";
+            $message_type = "success";
+        } else {
+            $message = "Error saving marks";
+            $message_type = "error";
+        }
+        $stmt->close();
+    }
 }
 
-// Get enrolled students
+// Get enrolled students with their results
 $students_query = "
-    SELECT DISTINCT
+    SELECT 
         s.student_id,
         s.reg_number,
         s.name,
+        s.email,
         r.ca_marks,
         r.final_marks,
         r.total_marks,
@@ -205,117 +230,152 @@ $students_stmt->execute();
 $students = $students_stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $students_stmt->close();
 
-// Function to determine student status
-function getStudentStatus($ca_marks, $final_marks, $total_marks) {
-    if($ca_marks === null || $final_marks === null) {
-        return ['status' => 'Not Entered', 'class' => 'status-pending', 'icon' => '-'];
-    }
-    
-    // Check if any component is below half
+// Calculate statistics
+$total_students = count($students);
+$students_with_results = count(array_filter($students, fn($s) => $s['ca_marks'] !== null));
+$average_score = $students_with_results > 0 
+    ? array_sum(array_column(array_filter($students, fn($s) => $s['total_marks'] !== null), 'total_marks')) / $students_with_results 
+    : 0;
+
+// Function to check if student needs supplementary
+function needsSupplementary($ca, $final, $total) {
+    if ($ca === null || $final === null) return false;
     $ca_half = 30; // Half of 60
     $final_half = 20; // Half of 40
     $total_half = 50; // Half of 100
     
-    if($ca_marks < $ca_half || $final_marks < $final_half || $total_marks < $total_half) {
-        return ['status' => 'Supplementary', 'class' => 'status-supplementary', 'icon' => '⚠️'];
-    } else {
-        return ['status' => 'Passed', 'class' => 'status-pass', 'icon' => '✓'];
-    }
+    return ($ca < $ca_half || $final < $final_half || $total < $total_half);
 }
-
 ?>
-
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Upload Results - <?= htmlspecialchars($module['module_code']) ?></title>
-    <link rel="stylesheet" href="../assets/css/auth.css">
     <style>
-        .auth-card {
-            width: 1200px;
-            max-width: 100%;
-            padding: 30px;
-            border-radius: 18px;
-            background: var(--white);
-            box-shadow: 0 20px 45px rgba(0,0,0,0.15);
-            margin: 30px auto;
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
 
-        h2 {
-            text-align: center;
-            color: var(--midnight-garden);
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f0f2f5;
+            color: #1e293b;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #0f172a, #1e293b);
+            color: white;
+            padding: 1rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            width: 100%;
+        }
+
+        .header h1 {
+            font-size: 1.8rem;
+            background: linear-gradient(135deg, #2dd4bf, #14b8a6);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .header a {
+            color: white;
+            text-decoration: none;
+            padding: 0.5rem 1.2rem;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            transition: all 0.3s;
+        }
+
+        .header a:hover {
+            background: #2dd4bf;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 2rem auto;
+            padding: 0 2rem;
         }
 
         .module-info {
-            background: linear-gradient(135deg, var(--terra-rosa), var(--honey-glow));
+            background: linear-gradient(135deg, #0f172a, #1e293b);
             color: white;
-            padding: 20px;
-            border-radius: 10px;
-            margin-bottom: 20px;
-            text-align: center;
+            padding: 2rem;
+            border-radius: 20px;
+            margin-bottom: 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
 
-        .module-info strong {
-            display: block;
-            font-size: 18px;
-            margin-bottom: 5px;
+        .module-details h2 {
+            font-size: 1.8rem;
+            margin-bottom: 0.5rem;
         }
 
-        .module-info small {
-            display: block;
-            opacity: 0.9;
+        .module-details p {
+            color: #94a3b8;
+        }
+
+        .module-stats {
+            text-align: right;
+        }
+
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: #2dd4bf;
         }
 
         .alert {
-            padding: 12px;
-            margin: 15px 0;
-            border-radius: 8px;
-            display: none;
+            padding: 1rem;
+            border-radius: 12px;
+            margin-bottom: 1.5rem;
         }
 
         .alert.success {
-            background: #d4edda;
-            color: #155724;
-            display: block;
-            border: 1px solid #c3e6cb;
+            background: #d1fae5;
+            color: #065f46;
+            border-left: 4px solid #10b981;
         }
 
         .alert.error {
-            background: #f8d7da;
-            color: #721c24;
-            display: block;
-            border: 1px solid #f5c6cb;
-        }
-
-        .info-box {
-            background: #e3f2fd;
-            border-left: 4px solid #2196F3;
-            padding: 15px;
-            border-radius: 4px;
-            margin: 15px 0;
-            color: #004085;
+            background: #fee2e2;
+            color: #991b1b;
+            border-left: 4px solid #ef4444;
         }
 
         .tabs {
             display: flex;
-            gap: 10px;
-            margin: 20px 0;
-            border-bottom: 2px solid #ddd;
+            gap: 1rem;
+            margin-bottom: 2rem;
+            border-bottom: 2px solid #e2e8f0;
         }
 
         .tab-btn {
-            padding: 10px 15px;
+            padding: 0.8rem 1.5rem;
             background: none;
             border: none;
             cursor: pointer;
-            font-weight: bold;
-            color: #666;
+            font-weight: 600;
+            color: #64748b;
             border-bottom: 3px solid transparent;
+            transition: all 0.3s;
         }
 
         .tab-btn.active {
-            color: var(--terra-rosa);
-            border-bottom-color: var(--terra-rosa);
+            color: #2dd4bf;
+            border-bottom-color: #2dd4bf;
         }
 
         .tab-content {
@@ -326,255 +386,258 @@ function getStudentStatus($ca_marks, $final_marks, $total_marks) {
             display: block;
         }
 
-        .form-section {
-            background: #f9f9f9;
-            padding: 20px;
-            border-radius: 8px;
-            margin: 20px 0;
+        .upload-card {
+            background: white;
+            border-radius: 20px;
+            padding: 2rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
         }
 
         .form-group {
-            margin-bottom: 15px;
+            margin-bottom: 1.5rem;
         }
 
-        label {
+        .form-group label {
             display: block;
-            margin-bottom: 5px;
-            font-weight: bold;
-            color: var(--midnight-garden);
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+            color: #0f172a;
         }
 
-        input[type="file"],
-        input[type="number"],
-        select {
+        .form-group input,
+        .form-group select {
             width: 100%;
-            padding: 10px;
-            border: 1px solid #ddd;
+            padding: 0.8rem;
+            border: 2px solid #e2e8f0;
             border-radius: 8px;
-            font-size: 14px;
-            box-sizing: border-box;
+            font-size: 1rem;
+            transition: all 0.3s;
         }
 
-        input:focus,
-        select:focus {
+        .form-group input:focus,
+        .form-group select:focus {
             outline: none;
-            border-color: var(--terra-rosa);
+            border-color: #2dd4bf;
+            box-shadow: 0 0 0 3px rgba(45, 212, 191, 0.1);
         }
 
         .btn {
-            padding: 12px 20px;
-            background: linear-gradient(135deg, var(--terra-rosa), var(--honey-glow));
-            color: white;
+            padding: 0.8rem 1.5rem;
             border: none;
             border-radius: 8px;
+            font-weight: 600;
             cursor: pointer;
-            font-weight: bold;
-            font-size: 14px;
+            transition: all 0.3s;
+            text-decoration: none;
+            display: inline-block;
         }
 
-        .btn:hover {
-            opacity: 0.9;
+        .btn-primary {
+            background: #2dd4bf;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #14b8a6;
+            transform: translateY(-2px);
         }
 
         .btn-secondary {
-            background: var(--minty-fresh);
-            color: var(--art-craft);
+            background: #e2e8f0;
+            color: #0f172a;
+        }
+
+        .btn-secondary:hover {
+            background: #cbd5e1;
         }
 
         table {
             width: 100%;
             border-collapse: collapse;
-            margin-top: 20px;
-        }
-
-        th, td {
-            padding: 12px;
-            border: 1px solid #ddd;
-            text-align: left;
+            background: white;
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
         }
 
         th {
-            background: var(--minty-fresh);
-            color: var(--art-craft);
-            font-weight: bold;
+            background: #f8fafc;
+            padding: 1rem;
+            text-align: left;
+            font-weight: 600;
+            color: #0f172a;
+            border-bottom: 2px solid #e2e8f0;
         }
 
-        tr:nth-child(even) {
-            background: #f9f9f9;
+        td {
+            padding: 1rem;
+            border-bottom: 1px solid #e2e8f0;
         }
 
-        .grade-cell {
-            font-weight: bold;
-            text-align: center;
-            font-size: 16px;
+        tr:hover {
+            background: #f8fafc;
         }
+
+        .grade-badge {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-weight: 600;
+        }
+
+        .grade-A { background: #d1fae5; color: #065f46; }
+        .grade-B { background: #dbeafe; color: #1e40af; }
+        .grade-C { background: #fef3c7; color: #92400e; }
+        .grade-D { background: #fee2e2; color: #991b1b; }
+        .grade-F { background: #fee2e2; color: #991b1b; }
 
         .status-badge {
             display: inline-block;
-            padding: 6px 12px;
-            border-radius: 6px;
-            font-size: 12px;
-            font-weight: bold;
-            text-align: center;
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-size: 0.8rem;
         }
 
-        .status-pass {
-            background: #d4edda;
-            color: #155724;
+        .status-draft {
+            background: #fef3c7;
+            color: #92400e;
         }
 
-        .status-supplementary {
-            background: #fff3cd;
-            color: #856404;
+        .status-published {
+            background: #d1fae5;
+            color: #065f46;
         }
 
-        .status-pending {
-            background: #e2e3e5;
-            color: #383d41;
-        }
-
-        .template-info {
-            background: white;
-            padding: 15px;
-            border-left: 4px solid var(--terra-rosa);
-            border-radius: 4px;
-            margin: 15px 0;
-            font-size: 13px;
-            font-family: monospace;
+        .supplementary {
+            background: #fee2e2;
+            color: #991b1b;
+            font-weight: 600;
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-size: 0.8rem;
         }
 
         .marks-input {
             display: flex;
-            gap: 10px;
-            align-items: flex-end;
+            gap: 0.5rem;
         }
 
         .marks-input input {
-            flex: 1;
+            width: 80px;
+            padding: 0.4rem;
+            border: 1px solid #e2e8f0;
+            border-radius: 4px;
         }
 
         .back-link {
+            margin-top: 2rem;
             text-align: center;
-            margin-top: 20px;
         }
 
         .back-link a {
-            color: var(--terra-rosa);
+            color: #2dd4bf;
             text-decoration: none;
-            font-weight: bold;
-            padding: 10px 20px;
-            border: 2px solid var(--terra-rosa);
-            border-radius: 8px;
-            display: inline-block;
-        }
-
-        .back-link a:hover {
-            background: var(--terra-rosa);
-            color: white;
+            font-weight: 600;
         }
 
         @media (max-width: 768px) {
-            .auth-card {
-                width: 95%;
-                padding: 15px;
+            .container {
+                padding: 0 1rem;
+            }
+
+            .module-info {
+                flex-direction: column;
+                text-align: center;
+                gap: 1rem;
+            }
+
+            .tabs {
+                flex-direction: column;
             }
 
             table {
-                font-size: 12px;
+                font-size: 0.9rem;
             }
 
-            th, td {
-                padding: 8px;
-            }
-
-            .marks-input {
-                flex-direction: column;
+            td, th {
+                padding: 0.5rem;
             }
         }
     </style>
 </head>
 <body>
 
-<div class="auth-card">
-    <h2>📝 Upload Results</h2>
+<div class="header">
+    <h1>CSMS Teacher</h1>
+    <a href="logout.php">🚪 Logout</a>
+</div>
 
+<div class="container">
+    <!-- Module Info -->
     <div class="module-info">
-        <strong><?= htmlspecialchars($module['module_code']) ?> - <?= htmlspecialchars($module['module_name']) ?></strong>
-        <small><?= htmlspecialchars($module['course_name']) ?> | Year <?= $module['year'] ?> | Semester <?= $module['semester'] ?></small>
+        <div class="module-details">
+            <h2><?= htmlspecialchars($module['module_code']) ?> - <?= htmlspecialchars($module['module_name']) ?></h2>
+            <p><?= htmlspecialchars($module['course_name']) ?> | Year <?= $module['year'] ?> | Semester <?= $module['semester'] ?></p>
+        </div>
+        <div class="module-stats">
+            <div class="stat-value"><?= $total_students ?></div>
+            <div>Enrolled Students</div>
+            <div class="stat-value" style="font-size: 1.2rem;">Avg: <?= round($average_score, 1) ?></div>
+        </div>
     </div>
 
     <?php if ($message): ?>
-        <div class="alert <?= $message_type === 'success' ? 'success' : 'error' ?>">
-            <?= htmlspecialchars($message) ?>
-        </div>
+        <div class="alert <?= $message_type ?>"><?= $message ?></div>
     <?php endif; ?>
 
     <!-- Tabs -->
     <div class="tabs">
-        <button class="tab-btn active" onclick="switchTab(event, 'csv-upload')">📤 Upload CSV</button>
-        <button class="tab-btn" onclick="switchTab(event, 'manual-entry')">✎ Manual Entry</button>
+        <button class="tab-btn active" onclick="switchTab(event, 'upload')">📤 CSV Upload</button>
+        <button class="tab-btn" onclick="switchTab(event, 'manual')">✏️ Manual Entry</button>
         <button class="tab-btn" onclick="switchTab(event, 'review')">👁️ Review Results</button>
     </div>
 
     <!-- CSV Upload Tab -->
-    <div id="csv-upload" class="tab-content active">
-        <div class="form-section">
-            <h3 style="margin-top: 0;">CSV File Upload</h3>
-            
-            <p><strong>CSV Format:</strong></p>
-            <div class="template-info">
-Reg_Number,CA_Marks,Final_Marks<br>
-12345b,45,35<br>
-1234ab,52,38<br>
-12345c,38,32
-            </div>
+    <div id="upload" class="tab-content active">
+        <div class="upload-card">
+            <h3 style="margin-bottom: 1.5rem;">📤 Upload Results via CSV</h3>
 
-            <div class="info-box">
-                <strong>Supplementary Criteria:</strong><br>
-                A student gets supplementary if any of these conditions are met:<br>
-                • CA Marks < 30 (half of 60), OR<br>
-                • Final Marks < 20 (half of 40), OR<br>
-                • Total Marks < 50 (half of 100)
+            <div style="background: #f8fafc; padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem;">
+                <p><strong>CSV Format:</strong></p>
+                <pre style="background: white; padding: 1rem; border-radius: 8px; margin-top: 0.5rem;">
+Reg_Number,CA_Marks,Final_Marks
+STU001,45,35
+STU002,52,38
+STU003,38,32</pre>
+                <p style="margin-top: 0.5rem; color: #64748b;">CA Marks: 0-60 | Final Marks: 0-40</p>
             </div>
-
-            <p><strong>Requirements:</strong></p>
-            <ul>
-                <li>CA Marks: 0-60</li>
-                <li>Final Marks: 0-40</li>
-                <li>Total: 0-100 (automatically calculated)</li>
-                <li>Grade: Automatically assigned</li>
-                <li>Status: Automatically determined (Passed or Supplementary)</li>
-            </ul>
 
             <form method="POST" enctype="multipart/form-data">
-                <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+                <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
                 <input type="hidden" name="action" value="upload_csv">
 
                 <div class="form-group">
-                    <label for="csv_file">Choose CSV File:</label>
+                    <label for="csv_file">Choose CSV File</label>
                     <input type="file" id="csv_file" name="csv_file" accept=".csv" required>
                 </div>
 
-                <button type="submit" class="btn">📤 Upload Marks</button>
+                <button type="submit" class="btn btn-primary">📤 Upload and Process</button>
+                <a href="download_template.php?module_id=<?= $module_id ?>" class="btn btn-secondary" style="margin-left: 1rem;">📥 Download Template</a>
             </form>
-
-            <p style="text-align: center; margin-top: 20px;">
-                <a href="download_template.php?module_id=<?= $module_id ?>" class="btn btn-secondary" style="display: inline-block;">📥 Download Template</a>
-            </p>
         </div>
     </div>
 
     <!-- Manual Entry Tab -->
-    <div id="manual-entry" class="tab-content">
-        <div class="form-section">
-            <h3 style="margin-top: 0;">Enter Marks Manually</h3>
+    <div id="manual" class="tab-content">
+        <div class="upload-card">
+            <h3 style="margin-bottom: 1.5rem;">✏️ Enter Marks Manually</h3>
 
             <form method="POST">
-                <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+                <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
                 <input type="hidden" name="action" value="save_marks">
 
                 <div class="form-group">
-                    <label for="student_id">Select Student:</label>
+                    <label for="student_id">Select Student</label>
                     <select id="student_id" name="student_id" required>
                         <option value="">-- Choose Student --</option>
                         <?php foreach ($students as $student): ?>
@@ -585,38 +648,39 @@ Reg_Number,CA_Marks,Final_Marks<br>
                     </select>
                 </div>
 
-                <div class="marks-input">
-                    <div style="flex: 1;">
-                        <label for="ca_marks">CA Marks (0-60):</label>
-                        <input type="number" id="ca_marks" name="ca_marks" min="0" max="60" step="0.5" required onchange="calculateTotal()">
+                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem;">
+                    <div class="form-group">
+                        <label for="ca_marks">CA Marks (0-60)</label>
+                        <input type="number" id="ca_marks" name="ca_marks" min="0" max="60" step="0.5" required>
                     </div>
-                    <div style="flex: 1;">
-                        <label for="final_marks">Final Marks (0-40):</label>
-                        <input type="number" id="final_marks" name="final_marks" min="0" max="40" step="0.5" required onchange="calculateTotal()">
+                    <div class="form-group">
+                        <label for="final_marks">Final Marks (0-40)</label>
+                        <input type="number" id="final_marks" name="final_marks" min="0" max="40" step="0.5" required>
                     </div>
-                    <div style="flex: 1;">
-                        <label>Total (0-100):</label>
-                        <input type="number" id="total_marks" disabled style="background: #f0f0f0;">
+                    <div class="form-group">
+                        <label>Total (Auto)</label>
+                        <input type="number" id="total_display" disabled style="background: #f8fafc;">
                     </div>
                 </div>
 
-                <button type="submit" class="btn" style="margin-top: 20px;">💾 Save Marks</button>
+                <button type="submit" class="btn btn-primary">💾 Save Marks</button>
             </form>
         </div>
     </div>
 
     <!-- Review Results Tab -->
     <div id="review" class="tab-content">
-        <h3>Results Summary</h3>
+        <div class="upload-card">
+            <h3 style="margin-bottom: 1.5rem;">👁️ Student Results</h3>
 
-        <?php if (count($students) > 0): ?>
+            <?php if (count($students) > 0): ?>
             <table>
                 <thead>
                     <tr>
                         <th>Reg Number</th>
                         <th>Student Name</th>
-                        <th>CA Marks</th>
-                        <th>Final Marks</th>
+                        <th>CA (0-60)</th>
+                        <th>Final (0-40)</th>
                         <th>Total</th>
                         <th>Grade</th>
                         <th>Status</th>
@@ -626,29 +690,41 @@ Reg_Number,CA_Marks,Final_Marks<br>
                     <?php foreach ($students as $student): 
                         $ca = $student['ca_marks'];
                         $final = $student['final_marks'];
-                        $total = ($ca !== null && $final !== null) ? $ca + $final : 0;
-                        
-                        $statusInfo = getStudentStatus($ca, $final, $total);
+                        $total = $student['total_marks'];
+                        $grade = $student['grade'];
+                        $needs_supp = ($ca !== null && $final !== null) ? needsSupplementary($ca, $final, $total) : false;
                     ?>
                     <tr>
                         <td><strong><?= htmlspecialchars($student['reg_number']) ?></strong></td>
                         <td><?= htmlspecialchars($student['name']) ?></td>
-                        <td><?= $ca !== null ? number_format($ca, 2) : '-' ?></td>
-                        <td><?= $final !== null ? number_format($final, 2) : '-' ?></td>
-                        <td><strong><?= $total > 0 ? number_format($total, 2) : '-' ?></strong></td>
-                        <td class="grade-cell"><?= $student['grade'] ?? '-' ?></td>
+                        <td><?= $ca !== null ? number_format($ca, 1) : '-' ?></td>
+                        <td><?= $final !== null ? number_format($final, 1) : '-' ?></td>
+                        <td><strong><?= $total !== null ? number_format($total, 1) : '-' ?></strong></td>
                         <td>
-                            <span class="status-badge <?= $statusInfo['class'] ?>">
-                                <?= $statusInfo['icon'] ?> <?= $statusInfo['status'] ?>
-                            </span>
+                            <?php if ($grade): ?>
+                                <span class="grade-badge grade-<?= $grade ?>"><?= $grade ?></span>
+                            <?php else: ?>
+                                -
+                            <?php endif; ?>
+                        </td>
+                        <td>
+                            <?php if ($student['status']): ?>
+                                <span class="status-badge status-<?= $student['status'] ?>">
+                                    <?= ucfirst($student['status']) ?>
+                                </span>
+                            <?php endif; ?>
+                            <?php if ($needs_supp): ?>
+                                <span class="supplementary">⚠️ Supplementary</span>
+                            <?php endif; ?>
                         </td>
                     </tr>
                     <?php endforeach; ?>
                 </tbody>
             </table>
-        <?php else: ?>
-            <p style="text-align: center; color: #666;">No students enrolled in this module</p>
-        <?php endif; ?>
+            <?php else: ?>
+                <p style="text-align: center; color: #64748b; padding: 2rem;">No students enrolled in this module</p>
+            <?php endif; ?>
+        </div>
     </div>
 
     <div class="back-link">
@@ -659,23 +735,37 @@ Reg_Number,CA_Marks,Final_Marks<br>
 <script>
 function switchTab(event, tabId) {
     // Hide all tabs
-    const contents = document.querySelectorAll('.tab-content');
-    contents.forEach(content => content.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(tab => {
+        tab.classList.remove('active');
+    });
     
-    // Remove active class from buttons
-    const buttons = document.querySelectorAll('.tab-btn');
-    buttons.forEach(btn => btn.classList.remove('active'));
+    // Remove active from all buttons
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.classList.remove('active');
+    });
     
     // Show selected tab
     document.getElementById(tabId).classList.add('active');
     event.target.classList.add('active');
 }
 
-function calculateTotal() {
-    const ca = parseFloat(document.getElementById('ca_marks').value) || 0;
-    const final = parseFloat(document.getElementById('final_marks').value) || 0;
-    document.getElementById('total_marks').value = (ca + final).toFixed(2);
-}
+// Auto-calculate total
+document.addEventListener('DOMContentLoaded', function() {
+    const caInput = document.getElementById('ca_marks');
+    const finalInput = document.getElementById('final_marks');
+    const totalDisplay = document.getElementById('total_display');
+    
+    if (caInput && finalInput && totalDisplay) {
+        function updateTotal() {
+            const ca = parseFloat(caInput.value) || 0;
+            const final = parseFloat(finalInput.value) || 0;
+            totalDisplay.value = (ca + final).toFixed(1);
+        }
+        
+        caInput.addEventListener('input', updateTotal);
+        finalInput.addEventListener('input', updateTotal);
+    }
+});
 </script>
 
 </body>
